@@ -398,32 +398,394 @@ idempotent (delete-if-present). Recovery is covered in §8.
 
 ## 5. API contract
 
-Cover all of the following.
+JSON over HTTPS, base path `/v1`. Everything below is what the frontend in `frontend/` codes
+against.
+
+### 5.0 Conventions and shared objects
+
+**IDs are strings.** Post IDs are 64-bit Snowflake values (§3.3). `2^63` exceeds JavaScript's
+`Number.MAX_SAFE_INTEGER` (`2^53 − 1`), so every ID crosses the wire as a decimal string. This is a
+contract rule, not a style preference — a numeric `id` silently corrupts in any JSON parser using
+IEEE-754 doubles.
+
+**Timestamps** are RFC 3339 UTC with millisecond precision: `2026-09-17T10:00:00.000Z`.
+
+**`Post`** — the single representation used by the timeline, single-post reads, search results and
+the publish response. One shape, so the frontend has one type.
+
+```json
+{
+  "id": "1827639201234567890",
+  "author": {
+    "id": "88213004",
+    "handle": "grace",
+    "display_name": "Grace",
+    "avatar_url": "https://cdn.chirp.example/a/88213004/64.webp"
+  },
+  "text": "the post body, at most 500 characters",
+  "image": {
+    "url": "https://cdn.chirp.example/m/9f21c/1280.webp",
+    "width": 1280,
+    "height": 720,
+    "alt": null
+  },
+  "created_at": "2026-09-17T10:00:00.000Z",
+  "revision": 1,
+  "edited_at": null,
+  "edit_count": 0,
+  "editable_until": "2026-09-17T10:15:00.000Z"
+}
+```
+
+| Field | Notes |
+|---|---|
+| `id` | Time-ordered, so `id` descending **is** reverse-chronological order (§3.4). |
+| `image` | `null` when the post has no image. Never partially populated. |
+| `revision` | 1 on publish, incremented per edit. The hydration path always returns the current revision (§3.4 step 5). |
+| `edited_at`, `edit_count` | `null` / `0` until the first edit. **`edit_count > 0` is the edited indicator** the frontend renders; it links to `/posts/{id}/revisions`. |
+| `editable_until` | Present **only** when the caller is the author and the 15-minute window is still open; absent otherwise. It is advisory — the server re-checks on `PATCH` (§1.3). |
+
+Authors do not carry a `follower_count`. The wide/narrow split (§3.3) is an internal routing
+decision and is not exposed.
 
 ### 5.1 Endpoints
 
-Method, path, request body, response body, status codes. Cover at least: publish a post, read a
-home timeline, read a single post, edit a post, read a post's edit history, search, follow,
-unfollow, delete an account.
+| # | Method | Path | Purpose |
+|---|--------|------|---------|
+| 1 | `POST` | `/v1/posts` | Publish |
+| 2 | `GET` | `/v1/timeline/home` | Home timeline |
+| 3 | `GET` | `/v1/posts/{post_id}` | Single post |
+| 4 | `PATCH` | `/v1/posts/{post_id}` | Edit inside the window |
+| 5 | `GET` | `/v1/posts/{post_id}/revisions` | Edit history |
+| 6 | `GET` | `/v1/search` | Search the public corpus |
+| 7 | `PUT` | `/v1/users/{user_id}/follow` | Follow |
+| 8 | `DELETE` | `/v1/users/{user_id}/follow` | Unfollow |
+| 9 | `DELETE` | `/v1/accounts/me` | Delete account, start purge |
+| 10 | `POST` | `/v1/media` | Presigned image upload (precedes 1) |
+
+---
+
+**1. `POST /v1/posts` — publish**
+
+```http
+POST /v1/posts
+Authorization: Bearer <access token>
+Idempotency-Key: 5f2b8c1e-0a3d-4e77-9b21-6c0d1a7e4f9b
+Content-Type: application/json
+
+{ "text": "first post", "media_id": "9f21c7a0-...", "alt": null }
+```
+
+`text`: 1–500 characters, counted as Unicode code points after NFC normalisation, so a family emoji
+costs 1, not 11 UTF-16 units. `media_id` optional (from endpoint 10), `alt` optional and ≤ 400
+characters. A post must have `text`; an image alone is rejected.
+
+`201 Created`, `Location: /v1/posts/{id}`, body is a `Post`. Returned as soon as the outbox write is
+durable — **before fanout** (§3.3 step 4), so latency does not depend on follower count.
+
+| Status | Meaning |
+|---|---|
+| 201 | Published. Repeat of a completed `Idempotency-Key` also returns 201 with the original body. |
+| 400 | `validation_failed` — empty or > 500 characters, bad `alt`. |
+| 401 | Missing/expired token. |
+| 409 | `media_not_ready` (no object uploaded at that `media_id`) or `idempotency_key_reuse` (same key, different body). |
+| 429 | Publish rate limit (§5.5). |
+| 503 | Post service or post store down (§4.2, §4.3). Retryable with the same key. |
+
+---
+
+**2. `GET /v1/timeline/home` — home timeline**
+
+```http
+GET /v1/timeline/home?limit=20&cursor=eyJ2IjoxLCJiIjoiMTgyNzYzOTIwMTIzNDU2Nzg5MCJ9
+Authorization: Bearer <access token>
+```
+
+`limit` 1–100, default 20. `cursor` omitted for the first page.
+
+```json
+{
+  "items": [ { "...": "Post" } ],
+  "page": {
+    "next_cursor": "eyJ2IjoxLCJiIjoiMTgyNzYzOTE4NzAwMDAwMDAwMCJ9",
+    "has_more": true
+  },
+  "degraded": false
+}
+```
+
+`degraded: true` means the push set was unavailable and the page was served from the pull path alone
+(§4.7) — fewer items than usual, narrow-author posts may be missing. The frontend shows a banner and
+keeps rendering; it is not an error.
+
+`next_cursor` is `null` exactly when `has_more` is `false`.
+
+| Status | Meaning |
+|---|---|
+| 200 | Including an empty `items` array — an empty timeline is not an error. |
+| 400 | `invalid_cursor` — malformed or truncated cursor. Terminal; the client restarts at page 1. |
+| 401 | Missing/expired token. |
+| 503 | Timeline service unavailable (§4.8). Retryable. |
+
+---
+
+**3. `GET /v1/posts/{post_id}` — single post**
+
+`200` with a `Post`. `404 post_not_found` if the ID does not exist, if the post was purged, **or if
+the author is in the tombstone set** (§4.13) — a deleted author's posts are indistinguishable from
+absent ones from outside. `503` on a post-store failure with a cold cache (§4.3).
+
+---
+
+**4. `PATCH /v1/posts/{post_id}` — edit**
+
+```http
+PATCH /v1/posts/1827639201234567890
+Authorization: Bearer <access token>
+If-Match: "3"
+Content-Type: application/json
+
+{ "text": "first post (fixed a typo)" }
+```
+
+Body text only — the image cannot be swapped (§1.3), so there is no `media_id` here. `If-Match`
+carries the revision the client believes it is editing, as an ETag; every `Post` read carries
+`ETag: "<revision>"`. Omitting it is allowed (last-write-wins); sending a stale one gets 412. This
+is the concurrent-edit guard for the same author on two devices.
+
+`200 OK` with the updated `Post`: `revision` incremented, `edited_at` set, `edit_count` incremented.
+
+| Status | Meaning |
+|---|---|
+| 200 | Edited. Invalidates `post:{post_id}` in the post cache; no timeline is rewritten (§3.4 step 5). |
+| 400 | `validation_failed`. |
+| 403 | `not_author` — authorisation is ownership, checked server-side against the token subject. |
+| 404 | `post_not_found`. |
+| 409 | `edit_window_closed` — more than 15 minutes after `created_at`, measured server-side. **Terminal**: retrying never succeeds, and the frontend must say so rather than offering a retry button. |
+| 412 | `revision_conflict` — `If-Match` did not match the current revision. |
+
+---
+
+**5. `GET /v1/posts/{post_id}/revisions` — edit history**
+
+Public, per §1.3. Newest first, at most 1 + the number of edits possible in 15 minutes, so no
+pagination.
+
+```json
+{
+  "post_id": "1827639201234567890",
+  "revisions": [
+    { "revision": 2, "text": "first post (fixed a typo)", "created_at": "2026-09-17T10:10:00.000Z" },
+    { "revision": 1, "text": "first post", "created_at": "2026-09-17T10:00:00.000Z" }
+  ]
+}
+```
+
+`200`, or `404 post_not_found` under the same rules as endpoint 3.
+
+---
+
+**6. `GET /v1/search` — public corpus**
+
+`GET /v1/search?q=coffee&limit=20&cursor=...`. `q` is 1–128 characters. Results are
+reverse-chronological, not relevance-ranked (ranking is out of scope, §1.2), which lets search reuse
+**the same post-ID cursor as the timeline** — one cursor implementation, one frontend type.
+
+Same envelope as endpoint 2 minus `degraded`, plus `"freshness_lag_ms": 820` — the indexer's current
+lag, exposed so the 5-second SLO (§11.3) is observable by clients and by the tests that check it.
+
+`200` / `400 validation_failed` (empty or over-long `q`) / `503 search_unavailable` (retryable;
+timelines are unaffected, §4.11).
+
+---
+
+**7–8. `PUT` / `DELETE /v1/users/{user_id}/follow`**
+
+No request body. `204 No Content` on success, and both are naturally idempotent — following twice is
+a no-op that still returns 204, so no `Idempotency-Key` is needed. `403 cannot_follow_self`,
+`404 user_not_found`, `429`, `503 follow_service_unavailable` (§4.10).
+
+Unfollow takes effect on the **next** timeline read via the tombstone/unfollow filter; existing
+materialised entries are not rewritten (§1.3, §3.4 step 4).
+
+---
+
+**9. `DELETE /v1/accounts/me` — delete account**
+
+```http
+DELETE /v1/accounts/me
+Authorization: Bearer <access token>
+Content-Type: application/json
+
+{ "confirm_handle": "grace" }
+```
+
+`202 Accepted` — the work is asynchronous by design:
+
+```json
+{
+  "purge_id": "prg_01J9X2",
+  "accepted_at": "2026-09-17T10:20:00.000Z",
+  "visible_removal": "immediate",
+  "purge_deadline": "2026-09-18T10:20:00.000Z"
+}
+```
+
+`visible_removal: immediate` is the tombstone write plus login block; `purge_deadline` is
+`accepted_at + 24 h`, the prompt's budget (§11.4). All sessions are revoked as part of the 202, so
+the token used for this call is dead on return. `400 confirm_mismatch`, `401`, `409 purge_in_flight`.
+
+---
+
+**10. `POST /v1/media` — presigned upload**
+
+```http
+POST /v1/media
+{ "content_type": "image/jpeg", "byte_size": 1843200 }
+```
+
+`201`:
+
+```json
+{
+  "media_id": "9f21c7a0-4b6e-4f0b-8f02-a1d33c9e7b10",
+  "upload_url": "https://uploads.chirp.example/...&X-Amz-Expires=900",
+  "expires_at": "2026-09-17T10:15:00.000Z"
+}
+```
+
+The client `PUT`s the bytes straight to `upload_url` (§3.3 step 1), then passes `media_id` to
+endpoint 1. `413 image_too_large` if `byte_size > 2097152`, `415 unsupported_media_type` for anything
+outside JPEG/PNG/WebP. Declared size and type are only a fast rejection — the media service
+re-validates by magic bytes and re-encodes (§4.12, §9).
 
 ### 5.2 Authentication and authorisation
 
-The scheme, where the credential lives, its lifetime, and how you revoke it.
+**Scheme.** `Authorization: Bearer <jwt>` on every endpoint above. Search and single-post reads
+accept an absent token and serve the public view; everything else is 401 without one.
+
+**Where it lives.** Two credentials:
+
+- **Access token** — a JWT signed with EdDSA, claims `sub` (user ID), `sid` (session ID), `iat`,
+  `exp`. **15-minute lifetime.** Held in memory by the client, never in `localStorage` (an XSS-
+  readable store, §9).
+- **Refresh token** — opaque, 30-day sliding lifetime, in an `HttpOnly; Secure; SameSite=Strict`
+  cookie scoped to `/v1/auth`. `POST /v1/auth/refresh` exchanges it for a new access token and
+  rotates the refresh token; a reused rotated token revokes the whole session family.
+
+The gateway (§4.1) verifies the signature locally — no per-request call to an identity service at
+timeline read rates.
+
+**Authorisation** is ownership only, because every post is public (§1.2). Edit and delete compare
+`sub` against the post's `author_id` **in the post service**, never at the gateway and never from a
+client-supplied author field.
+
+**Revocation.** A 15-minute access token cannot be withdrawn mid-life by signature checks alone, so
+the gateway consults a **revoked-`sid` set** (Redis, entries expiring after 15 minutes — bounded
+because it only needs to outlive the longest-lived token). Deleting an account, logging out, or a
+password change writes every one of that user's `sid` values into it. Worst-case exposure is
+therefore 0 seconds, not 15 minutes, at the cost of one cached set lookup per request.
 
 ### 5.3 Pagination
 
-The mechanism and why. State what happens when new posts arrive mid-page.
+**Mechanism: forward-only cursor, descending post ID.** The cursor is an opaque base64url string;
+its current payload is `{"v":1,"b":"<post_id>"}`, the ID of the last item returned. Clients must
+treat it as opaque — the `v` field exists so the encoding can change without breaking live clients.
+
+**Why not offset.** An offset over a feed that gains ~579 posts/s (§3.1) shifts under the reader: a
+post inserted at the head while they page makes `OFFSET 20` return an item they already saw.
+Offsets also force the merge in §3.4 to materialise and count everything before the offset, which
+gets more expensive the deeper the page. A cursor is O(depth of one page) and is meaningful against
+**both** halves of the hybrid — the Redis list slice and the author-index range read both accept
+"give me IDs `< cursor`" (§3.4 step 3).
+
+**New posts arriving mid-page.** They get higher IDs than the cursor, and pagination only ever moves
+toward lower IDs, so:
+
+- **No duplicates.** A post already returned has an ID ≥ the cursor and cannot appear on a later page.
+- **No new posts mid-scroll.** Anything published after page 1 is invisible until the client
+  restarts from `cursor = null`. That is deliberate: the alternative injects items above the reader's
+  scroll position.
+- The first response's newest `id` is what the client keeps to poll for "N new posts" and to decide
+  whether a refresh is warranted.
+
+**Trimmed depth.** Materialised timelines hold 800 entries (§4.7). Paging past 800 does not 404 —
+the timeline service falls through to the author-index path for the viewer's followees and keeps
+serving, more slowly. The frontend sees no difference beyond latency.
+
+**Edits during pagination.** An edit does not change a post's ID, so it does not move between pages.
+A reader who already passed the post keeps revision N in their rendered DOM; a page fetched after
+the edit hydrates revision N+1. Both are correct views of different read times; §12 traces this.
 
 ### 5.4 Idempotency
 
-Which operations are idempotent, and how a client retries a publish safely.
+| Operation | Idempotent? | Mechanism |
+|---|---|---|
+| `POST /v1/posts` | Yes, with a key | `Idempotency-Key` header, required |
+| `POST /v1/media` | No | A wasted presign is garbage-collected after 15 minutes |
+| `PATCH /v1/posts/{id}` | Effectively | `If-Match` makes a duplicate retry fail 412 instead of double-editing |
+| `PUT`/`DELETE` follow | Yes, naturally | Set semantics; repeat returns 204 |
+| `DELETE /v1/accounts/me` | Yes | Second call returns 409 `purge_in_flight` with the original `purge_id` |
+
+**How a client retries a publish safely.** The client generates a UUIDv4 before the first attempt and
+reuses it for every retry of *that* post. The post service stores `(user_id, key) → (request hash,
+status, response body)` for 24 hours, written in the same partition transaction as the post row —
+so a crash between "post written" and "key recorded" is impossible.
+
+- Same key, same body, original completed → 201 with the stored body. The client sees one post.
+- Same key, same body, original still in flight → `409 idempotency_in_progress`, retryable after
+  `Retry-After`.
+- Same key, **different** body → `409 idempotency_key_reuse`. Terminal: it means a client bug.
+
+This is what makes the frontend's optimistic write safe. On a timeout the client cannot tell whether
+the post was created, and retrying with the same key resolves that ambiguity without a duplicate
+post — the alternative is an optimistic UI that occasionally publishes twice.
 
 ### 5.5 Error model
 
-The shape of an error response. The status codes you use, and what each means in your system.
-Distinguish retryable from terminal.
+Every non-2xx response has this body, and nothing else ever appears in an error position:
 
-**Your frontend in `frontend/` must implement this contract. Write it so you can code against it.**
+```json
+{
+  "error": {
+    "code": "edit_window_closed",
+    "message": "This post can no longer be edited.",
+    "retryable": false,
+    "request_id": "01J9X2K3M4N5P6Q7R8S9T0",
+    "details": { "editable_until": "2026-09-17T10:15:00.000Z" }
+  }
+}
+```
+
+| Field | Contract |
+|---|---|
+| `code` | Stable `snake_case` enum. The frontend switches on this, never on `message`. |
+| `message` | Human-readable, already end-user safe. Never contains internal identifiers. |
+| `retryable` | **Machine-readable.** `true` means the identical request may succeed later. The frontend shows a retry affordance if and only if this is `true`. |
+| `request_id` | Echoed in `X-Request-Id`, the trace key for §10 and §12. Shown in the UI so a user report is debuggable. |
+| `details` | Optional, code-specific. Absent by default. |
+
+| Status | Retryable | Codes | What it means here |
+|---|---|---|---|
+| 400 | no | `validation_failed`, `invalid_cursor`, `confirm_mismatch` | Malformed request. Retrying the same bytes always fails. |
+| 401 | no* | `unauthenticated`, `token_expired` | *Terminal for the request, but `token_expired` triggers one silent refresh (§5.2) and one replay. |
+| 403 | no | `not_author`, `cannot_follow_self` | Authenticated, not permitted. |
+| 404 | no | `post_not_found`, `user_not_found` | Absent, purged, or tombstoned — deliberately indistinguishable. |
+| 409 | mixed | `edit_window_closed` (no), `media_not_ready` (no), `idempotency_key_reuse` (no), `idempotency_in_progress` (**yes**), `purge_in_flight` (no) | State conflict. `retryable` is per code, which is exactly why it is a field and not inferred from the status. |
+| 412 | no | `revision_conflict` | Client must re-read and re-apply. |
+| 413 | no | `image_too_large` | Over 2 MB. |
+| 415 | no | `unsupported_media_type` | Not JPEG/PNG/WebP. |
+| 429 | **yes** | `rate_limited` | With `Retry-After` and `details.limit` / `details.reset_at`. Publish 300/h/user, timeline 120/min, search 60/min, follow 600/day, all per token; anonymous reads 60/min per IP. |
+| 500 | **yes** | `internal_error` | Unclassified. Never leaks a stack trace. |
+| 503 | **yes** | `post_service_unavailable`, `timeline_unavailable`, `search_unavailable`, `follow_service_unavailable` | A named dependency from §4 is down. `Retry-After` present. Clients back off exponentially with jitter. |
+
+Note that 429 and 503 are the only codes that should ever drive an automatic client retry, and the
+backoff belongs in one HTTP layer in the frontend rather than at each call site.
+
+**Reaching the error path in the mock.** The fixture layer in `frontend/` honours a `?fault=<code>`
+query parameter and an equivalent toggle in the UI, so any row of this table can be produced without
+editing code (SPEC requirement). The parameter is a mock affordance, not part of the production
+contract.
 
 ---
 

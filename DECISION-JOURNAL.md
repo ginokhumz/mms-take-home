@@ -41,6 +41,8 @@ Fill this in at the end. Wall-clock hours, honestly.
 
 **Wednesday, about 21:30** Planned out the design and core components
 
+**Wednesday, about 21:45** Planned out the design and core components
+
 
 ---
 
@@ -76,7 +78,7 @@ in the debrief.
 | Wednesday 12:00 | Instructed Claude to write a context file from the instructions that will be used during developement | A claude file and settings file for permissions for the tools | Nothing yet. It looks solid, I'll update where I see it misbehaving |
 | Wednesday (§1 drafting) | Asked Claude to expand on use cases and scope | Draft covering: prioritised use cases, exclusions with reasons, the fanout-vs-skew arithmetic (20,000 top accounts × 1M = 20B edges vs 20M × 50 = 1B), an adopted reading (follower counts include inactive registered accounts), and an assumptions table | Moved the arithmatic to section 2 because that is the best place for it, remove repetition |
 | Wednesday (§3/§4 drafting) | Asked Claude to propose the high-level design diagram and the core components | Hybrid fanout (push under 100k followers, read-time merge above), Mermaid diagram, write/read path prose, and 13 component subsections each with store / scaling / unavailability. Grounding arithmetic computed in the shell: 579 posts/s avg, 1,736/s at 3× peak, 28,935 timeline writes/s, one 3M-follower post = 3M writes ≈ 104 s of the whole average fanout budget, 384 GB materialised timelines, ~405 TB/month images | Kept the hybrid and the 104 s figure — that number is the argument for it. Kept the decision that timeline entries store `(post_id, author_id)` only and never the body, because it makes §11.2 (edit propagation) and §11.4 (purge) nearly free. Still to check against myself: the 100,000-follower wide/narrow threshold is asserted, not derived — I need to justify it in §11.1 or move it. Peak multiplier of 3× is used here before §2 states it; §2 must state it or the two sections disagree |
-| | | | |
+| Wednesday (§5 drafting) | Asked Claude to propose the API contract for §5 | A full contract: 10 endpoints (publish, home timeline, single post, PATCH edit, revisions, search, follow, unfollow, delete account, presigned media), one shared `Post` object, Bearer JWT with a 15-min access token plus rotating refresh cookie and a revoked-`sid` set, opaque base64 descending post-ID cursor, `Idempotency-Key` on publish with a stored `(user_id, key) → response` record, and an error envelope with a machine-readable `retryable` flag. Verified in the shell that the two example cursor strings actually base64-decode to `{"v":1,"b":"..."}` and that the second is lower than the first | Kept the shape. The parts I want to be able to defend out loud and believe: IDs as strings (Snowflake is 64-bit, JS is safe to 2^53−1), `retryable` as an explicit field rather than inferred from the status (409 covers both `edit_window_closed`, which is permanent, and `idempotency_in_progress`, which is not), and reusing the timeline cursor for search since ranking is out of scope so both sort by post ID descending. Changed: made `degraded: true` a 200-with-banner rather than an error, to match §4.7 which already says the timeline serves a degraded page from the pull path. Still unverified and flagged in the entry above: the rate-limit numbers and the per-request tombstone lookup are asserted, not derived from §2 |
 ---
 
 ## Assumptions I made
