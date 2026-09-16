@@ -29,25 +29,13 @@ Fill this in at the end. Wall-clock hours, honestly.
 
 ## Entries
 
-### Example entry, delete me
-
-**Saturday, about 09:20.** Read the Problem 1 prompt twice. First reaction: the deletion
-requirement is the hard one, not the fanout. I want to check that before I commit to a shape.
-
-**Saturday, about 09:50.** Worked the fanout arithmetic on paper. The average and the skew figure
-do not sit together the way I first read them. Wrote down the reading I am adopting and moved on.
-
-**Saturday, about 11:30. Dead end.** Spent 40 minutes on a design that rewrites every timeline
-entry when a post is edited. Abandoned it. At the edit volume the prompt implies, the rewrite cost
-is larger than the whole write path. Storing post identifiers in the timeline removes the problem
-entirely. Kept the second approach.
-
----
-
 ### Your entries start here
 
+**Wednesday, about 11:00** Read instructions and browsed the 2 problems. Created the repos and initial commits. 
 
+**Wednesday, about 11:30** Started with Problem 1. Read through the documents to get understanding of what needs to be done and what is required.
 
+**Wednesday, about 12:00** Initialized structure for AI agents that covers the whole project.
 ---
 
 ## Changes of mind
@@ -79,8 +67,10 @@ in the debrief.
 
 | When | What I asked | What came back | What I kept, changed or discarded, and why |
 |------|--------------|----------------|--------------------------------------------|
+| Wednesday 12:00 | Instructed Claude to write a context file from the instructions that will be used during developement | A claude file and settings file for permissions for the tools | Nothing yet. It looks solid, I'll update where I see it misbehaving |
 | | | | |
-
+| | | | |
+| | | | |
 ---
 
 ## Assumptions I made
