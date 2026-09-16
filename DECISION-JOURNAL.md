@@ -36,6 +36,8 @@ Fill this in at the end. Wall-clock hours, honestly.
 **Wednesday, about 11:30** Started with Problem 1. Read through the documents to get understanding of what needs to be done and what is required.
 
 **Wednesday, about 12:00** Initialized structure for AI agents that covers the whole project.
+
+**Wednesday, about 21:00** Planned out the plan and capacity section
 ---
 
 ## Changes of mind
@@ -68,7 +70,7 @@ in the debrief.
 | When | What I asked | What came back | What I kept, changed or discarded, and why |
 |------|--------------|----------------|--------------------------------------------|
 | Wednesday 12:00 | Instructed Claude to write a context file from the instructions that will be used during developement | A claude file and settings file for permissions for the tools | Nothing yet. It looks solid, I'll update where I see it misbehaving |
-| | | | |
+| Wednesday (§1 drafting) | Asked Claude to expand on use cases and scope | Draft covering: prioritised use cases, exclusions with reasons, the fanout-vs-skew arithmetic (20,000 top accounts × 1M = 20B edges vs 20M × 50 = 1B), an adopted reading (follower counts include inactive registered accounts), and an assumptions table | Moved the arithmatic to section 2 because that is the best place for it, remove repetition |
 | | | | |
 | | | | |
 ---

@@ -12,6 +12,50 @@ Length is not marked. A tight 2,000 words beats a padded 8,000.
 State the use cases you are designing for, in priority order. State what you excluded and why.
 State the assumptions you are making that the prompt did not settle.
 
+### 1.1 Use cases, in priority order
+
+Priority is set by how often each thing happens and how badly users notice when it breaks.
+
+| # | Use case | Why it ranks here |
+|---|----------|-------------------|
+| 1 | **Read home timeline.** A signed-in user loads the newest posts from accounts they follow, then pages back with "load more". | Happens most often (see §2 read ratio). If this is slow, the product feels broken. |
+| 2 | **Publish a post.** Up to 500 characters, with an optional image up to 2 MB. | 50M/day ≈ 580/s on average. Every other feature depends on posts existing. |
+| 3 | **Follow / unfollow.** | Decides who is in each timeline. It has to take effect quickly, but follows happen far less often than reads. |
+| 4 | **Search public posts.** A new post must show up within 5 s. | Hard freshness target, but it runs on a separate pipeline and can degrade without breaking timelines. |
+| 5 | **Edit a post within 15 min, and view its edit history.** | Rare compared with publishing, and the time window is short. Its cost is consistency: timelines, caches and search copies can disagree for a while (§11.2, §12). |
+| 6 | **Delete account and purge.** The user's posts disappear from every timeline within 24 h. | Least frequent, but the deadline is non-negotiable (a legal and trust promise). The 24 h budget means it can run as a background job. |
+
+### 1.2 Out of scope
+
+| Excluded | Why |
+|----------|-----|
+| DMs, notifications, trending, ads, ranking | The prompt excludes them. The timeline is **reverse-chronological** only, with no ranking. |
+| Follow graph storage internals | The prompt excludes them. I assume a graph service that answers "followers of X" (paged) and "does A follow B". |
+| Moderation policy | The prompt excludes it. There is a hook on publish/edit (before fanout and indexing) and on image processing. Takedowns reuse the purge path. |
+| Replies, reposts, likes, quote posts | Not in the brief. Each would change fanout and deletion (for example, what happens to a repost of a deleted post), so I left them out rather than half-designing them. |
+| Private or protected accounts | The brief says "public". Every post is visible to everyone, so the timeline and search need no per-viewer access checks. |
+| Deleting or editing a single post outside the window | Not in the brief. Account purge covers the removal path. |
+| Auth UI, sign-up, password reset | Assumed to be an existing identity provider. §5.2 only covers the token. |
+
+### 1.3 Assumptions the prompt does not settle
+
+| Assumption | Value | Used in |
+|------------|-------|---------|
+| Reading of fanout vs skew | Follower counts include inactive registered accounts; "average fanout 50" means active timelines written per post. The prompt's figures cannot both hold otherwise (§2.1) | §2, §11.1 |
+| Active user | Opens a timeline at least once a day; the 20M figure is daily actives | §2 |
+| Registered accounts | ~500M (needed for 1M+ follower counts, per §2.1) | §2, §11.1 |
+| Posts per active user | 50M / 20M = 2.5 posts/day on average, heavily skewed | §2 |
+| Read-to-write ratio | Stated and derived in §2 | §2 |
+| Peak multiplier | Stated in §2 | §2 |
+| Timeline ordering | Reverse-chronological by publish time; edits do not change position | §5.3, §12 |
+| Edit semantics | Body text only; the image cannot be swapped. Each edit creates a new revision; history is public | §6, §11.2 |
+| Edit window boundary | Checked on the server against the publish time, ±0 grace; client clock ignored | §5.1 |
+| Unfollow | Stops future posts arriving immediately; existing timeline entries are hidden when read, not rewritten | §11.1 |
+| Deletion scope | Posts, images, edit history, timeline entries, search docs, follow edges. Aggregate logs and metrics are anonymised, not purged | §9, §11.4 |
+| Deleted account during 24 h window | Account is blocked from login and the profile is hidden immediately; the 24 h budget covers only copies in timelines, caches and search | §11.4 |
+| Timeline depth | Materialised timelines keep only the newest ~800 entries per user; older pages are rebuilt on demand | §2, §6 |
+| Single region | Designed for one region with multi-AZ; multi-region noted in §14 | §3, §8 |
+
 ---
 
 ## 2. Capacity estimation
@@ -32,6 +76,27 @@ Cover at least:
 
 If two constraints in the prompt do not reconcile arithmetically, show the calculation that proves
 it and state the reading you adopt.
+
+### 2.1 Average fanout and follower skew do not reconcile
+
+```
+Top accounts        = 20,000,000 active users × 0.1%      = 20,000 accounts
+Edges they need     = 20,000 × 1,000,000 followers (min)   = 20,000,000,000 follows
+Edges at avg 50     = 20,000,000 users × 50                =  1,000,000,000 follows
+Gap                 = 20B / 1B                             = 20× more than the whole graph
+Per active user     = 20B / 20M                            = must follow ≥ 1,000 top accounts
+```
+
+Both figures cannot describe the same 20M users.
+
+**Reading I adopt:**
+- Follower counts include **all registered accounts** (~500M assumed, §1.3), most of them inactive.
+- "Average fanout 50" is the number of **active timelines one post is written into**, averaged over
+  posts. Most posts come from small accounts, which keeps the per-post average low.
+
+**What this does to the write path:** pushing one post from a 1M-follower account means ≥ 1M
+timeline writes for one post, 20,000× the average post's 50. Large accounts are therefore not
+fanned out at write time (§11.1).
 
 ---
 
