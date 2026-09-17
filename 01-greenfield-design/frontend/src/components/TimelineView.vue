@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue';
 import { useTimelineStore } from '../stores/timeline';
-import type { PostId } from '../api/types';
+import type { Post, PostId } from '../api/types';
+import { VIEWER_ID } from '../api/mockControls';
 import ComposeBox from './ComposeBox.vue';
+import EditBox from './EditBox.vue';
 import PostCard from './PostCard.vue';
 import ErrorPanel from './ErrorPanel.vue';
 import DegradedBanner from './DegradedBanner.vue';
@@ -17,6 +19,23 @@ onMounted(() => void store.loadFirstPage());
 const openRevisions = ref<PostId | null>(null);
 function toggleRevisions(id: PostId): void {
   openRevisions.value = openRevisions.value === id ? null : id;
+}
+
+const editing = ref<PostId | null>(null);
+
+/**
+ * The server sends editable_until only to the author while the window is open, so its presence is
+ * the signal. The client deliberately does not also test it against its own clock: the field is
+ * advisory, the server re-checks on save, and a browser clock that is minutes out would otherwise
+ * hide a control that would have worked. A rejection is the real answer, and it renders as one.
+ */
+function canEdit(post: Post): boolean {
+  return post.author.id === VIEWER_ID && post.editable_until !== undefined;
+}
+
+function openEdit(id: PostId): void {
+  store.editError = null;
+  editing.value = id;
 }
 </script>
 
@@ -45,9 +64,19 @@ function toggleRevisions(id: PostId): void {
       <PostCard v-for="post in store.items" :key="post.id" :post="post">
         <template #meta>
           <EditedIndicator :post="post" @toggle="toggleRevisions(post.id)" />
+          <button v-if="canEdit(post)" type="button" class="link" @click="openEdit(post.id)">
+            Edit
+          </button>
         </template>
         <template #footer>
-          <RevisionsPanel v-if="openRevisions === post.id" :post-id="post.id" />
+          <EditBox v-if="editing === post.id" :post="post" @close="editing = null" />
+          <!-- Keyed on the revision so that saving an edit remounts the panel and refetches:
+               an open history that still showed the pre-edit list would be wrong. -->
+          <RevisionsPanel
+            v-if="openRevisions === post.id"
+            :key="post.revision"
+            :post-id="post.id"
+          />
         </template>
       </PostCard>
 
@@ -67,3 +96,16 @@ function toggleRevisions(id: PostId): void {
     </template>
   </section>
 </template>
+
+<style scoped>
+.link {
+  font: inherit;
+  font-size: 0.8rem;
+  background: none;
+  border: none;
+  padding: 0;
+  color: #0b57d0;
+  text-decoration: underline;
+  cursor: pointer;
+}
+</style>

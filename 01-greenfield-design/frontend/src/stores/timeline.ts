@@ -1,8 +1,8 @@
 import { computed, ref } from 'vue';
 import { defineStore } from 'pinia';
-import { getHomeTimeline, publishPost } from '../api/client';
+import { editPost, getHomeTimeline, publishPost } from '../api/client';
 import { ApiError } from '../api/errors';
-import type { Post } from '../api/types';
+import type { Post, PostId } from '../api/types';
 
 export interface PendingPost {
   localId: string;
@@ -166,6 +166,31 @@ export const useTimelineStore = defineStore('timeline', () => {
     items.value = [confirmed, ...items.value];
   }
 
+  const editError = ref<ApiError | null>(null);
+
+  /**
+   * No optimistic update here, and the asymmetry with publish is deliberate. The window the
+   * client can see is advisory and the server re-checks it, so the only honest answer about
+   * whether an edit landed is the response to the request.
+   */
+  async function applyEdit(id: PostId, text: string): Promise<boolean> {
+    const current = items.value.find((p) => p.id === id);
+    if (current === undefined) return false;
+    editError.value = null;
+    try {
+      // If-Match carries the revision the client believes it is editing, taken from the post it
+      // is rendering. The contract defines the ETag as exactly that revision.
+      const updated = await editPost(id, { text }, current.revision);
+      // An edit does not change the post's ID, so this is a replacement in place: no reordering,
+      // no effect on the cursor, and a reader part-way through paginating sees only new text.
+      items.value = items.value.map((p) => (p.id === id ? updated : p));
+      return true;
+    } catch (e) {
+      editError.value = asApiError(e);
+      return false;
+    }
+  }
+
   return {
     status,
     items,
@@ -176,6 +201,7 @@ export const useTimelineStore = defineStore('timeline', () => {
     error,
     loadMoreError,
     composeError,
+    editError,
     draft,
     isEmpty,
     canLoadMore,
@@ -184,6 +210,7 @@ export const useTimelineStore = defineStore('timeline', () => {
     restart,
     publish,
     retryPending,
+    applyEdit,
   };
 });
 

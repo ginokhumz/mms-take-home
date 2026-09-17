@@ -179,8 +179,9 @@ seeds.push({
   edits: [{ at: '2026-09-17T10:10:00.000Z', text: 'first post (fixed a typo)' }],
 });
 
-// The viewer's post with the edit window still open. The mock's clock is pinned to 10:05, so a
-// window that closes at 10:14 is open and this is the one post offering an Edit control.
+// The viewer's post with the edit window still open. The fixture clock is pinned to 10:12, so a
+// window that closes at 10:14 is open and this is the one post offering an Edit control. The
+// viewer's two older posts below close at 10:11 and 10:10, which is why they omit the field.
 seeds.push({
   author: VIEWER,
   at: '2026-09-17T09:59:00.000Z',

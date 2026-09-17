@@ -83,6 +83,87 @@ function getHomeTimeline(url: URL, res: ServerResponse): void {
   send(res, 200, page);
 }
 
+/**
+ * The fixture clock. The corpus timestamps are fixed, so a real clock would slam the edit window
+ * shut on every post the moment the reviewer ran this, and the state would depend on the time of
+ * day they happened to run it.
+ *
+ * The pin is chosen so the corpus and this check cannot disagree. The viewer's newest post is from
+ * 09:59 and its window closes at 10:14; the next one is from 09:56 and closed at 10:11. Any clock
+ * between those two leaves exactly one post editable, which is what the corpus advertises by
+ * carrying editable_until on that one post and omitting it on the others.
+ */
+const MOCK_NOW = Date.parse('2026-09-17T10:12:00.000Z');
+
+const EDIT_WINDOW_MS = 15 * 60_000;
+
+/** PATCH /v1/posts/{id} — the checks in the order the contract puts them. */
+async function edit(id: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const index = state.posts.findIndex((p) => p.id === id);
+  const current = state.posts[index];
+  if (current === undefined) {
+    fail(res, 'post_not_found', 404, 'This post is no longer available.', false);
+    return;
+  }
+
+  // Ownership is a server-side check. The client hides the control, but hiding is not enforcing.
+  if (current.author.id !== VIEWER.id) {
+    fail(res, 'not_author', 403, 'You can only edit your own posts.', false);
+    return;
+  }
+
+  const closesAt = Date.parse(current.created_at) + EDIT_WINDOW_MS;
+  if (MOCK_NOW > closesAt) {
+    sendFault(
+      res,
+      faultResponse('edit_window_closed', {
+        status: 409,
+        message: 'This post can no longer be edited.',
+        retryable: false,
+        details: { editable_until: new Date(closesAt).toISOString() },
+      }),
+    );
+    return;
+  }
+
+  // If-Match carries the revision the client believes it is editing. Absent is allowed and means
+  // last write wins; present and stale means someone else's edit landed first.
+  const ifMatch = req.headers['if-match'];
+  if (typeof ifMatch === 'string' && ifMatch !== `"${current.revision}"`) {
+    fail(
+      res,
+      'revision_conflict',
+      412,
+      'This post changed since you opened it. Reload to see the latest version.',
+      false,
+    );
+    return;
+  }
+
+  const text = textOrNull(await readBody(req));
+  if (text === null) {
+    fail(res, 'validation_failed', 400, 'Your post must be between 1 and 500 characters.', false);
+    return;
+  }
+
+  const editedAt = new Date(MOCK_NOW).toISOString();
+  const updated: Post = {
+    ...current,
+    text,
+    revision: current.revision + 1,
+    edited_at: editedAt,
+    edit_count: current.edit_count + 1,
+  };
+  // The ID does not change, so the post keeps its place: an edit has no pagination effect.
+  state.posts = state.posts.map((p) => (p.id === id ? updated : p));
+  revisions.set(id, [
+    { revision: updated.revision, text, created_at: editedAt },
+    ...(revisions.get(id) ?? []),
+  ]);
+
+  send(res, 200, updated, { ETag: `"${updated.revision}"` });
+}
+
 /** GET /v1/posts/{id}/revisions — public, newest first, not paginated. */
 function getRevisions(id: string, res: ServerResponse): void {
   const history = revisions.get(id);
@@ -198,6 +279,17 @@ export function chirpMock(): Plugin {
               return;
             }
             getHomeTimeline(url, res);
+            return;
+          }
+
+          const patchMatch = /^\/posts\/(\d+)$/.exec(path);
+          if (method === 'PATCH' && patchMatch !== null) {
+            const fault = maybeFault(url, 'patch');
+            if (fault !== null) {
+              sendFault(res, fault);
+              return;
+            }
+            await edit(patchMatch[1] ?? '', req, res);
             return;
           }
 
