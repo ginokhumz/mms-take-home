@@ -1182,6 +1182,206 @@ model would be wrong.
 Name the first component that breaks as load grows, and at what load. Then the second, and the
 third. For each, say what you do about it.
 
+### 7.0 The read load these numbers are measured against
+
+§7 is measured against the peak figures from §2. Restated here so this section can be read on its
+own:
+
+```
+writes      50,000,000 posts/day ÷ 86,400        =    579 posts/s,      1,736/s at 3x peak
+fanout      579 x 50 average                     = 28,935 entries/s,   86,806/s at 3x peak
+reads       20,000,000 actives x 25 timeline requests/day
+                                                 = 500,000,000/day
+                                                 =  5,787 req/s,       17,361/s at 3x peak
+hydration   500,000,000 x 20 posts per page      = 10,000,000,000 post reads/day
+                                                 = 115,741/s,         347,222/s at 3x peak
+ratio       (500M timeline + 100M profile/single-post + 20M search) ÷ 50M writes
+                                                 = 620M ÷ 50M         = 12.4 : 1
+```
+
+The 3x peak multiplier is a diurnal assumption (§2): a single-region product concentrates traffic
+into roughly an 8-hour band, so the busy hour runs ~3x the 24-hour mean.
+
+### 7.1 How I rank what breaks first
+
+Not by absolute size — by **headroom multiple**: capacity ÷ today's peak demand. Small headroom
+first, because that is the component that a bad week, not a bad year, takes out.
+
+| # | Component | Peak demand today | Capacity as designed | Headroom | Breaks when |
+|---|---|---|---|---|---|
+| 1 | Fanout → timeline store | 190k–295k entries/s (see 7.2) | ~400k entries/s | **1.4x** | Posting rate rises ~40%, or the follower mix shifts up |
+| 2 | Post cache → post store | 347k hydrations/s, 17.4k/s of misses | ~25k reads/s on the post store | **1.4x** | Cache hit rate falls from 95% to 90% |
+| 3 | Search indexer → 5 s freshness | 1,736 docs/s | ~3,500 docs/s per hot shard set | **2x** | Indexer lag exceeds ~3 s, breaking the SLO before capacity |
+| 4 | Read-time merge (wide followees) | 0–3 wide followees per viewer | ~10 before the merge doubles read latency | ~3x | Wide accounts get more popular, or the threshold drops |
+| 5 | Purge of a wide account | 35 deletes/s per account | thousands/s | >50x | Mass-deletion event, not organic growth |
+| 6 | Image egress | 10.4 GB/s at peak | CDN-bound, origin 6 TB/day | high | CDN hit rate drops below ~95% |
+
+Items 1 and 2 are within a factor of 1.5 of their ceiling today. Everything below item 3 is a
+year-two problem.
+
+### 7.2 First to break: fanout into the timeline store
+
+**The average fanout figure hides the demand.** The timeline cluster is sized by memory, not
+throughput — 20M × 800 × 24 B ≈ 384 GB (§4.7), which at 48 GB per shard is 8 shards. At ~100k
+simple ops/s per shard and 2 ops per entry (`LPUSH` + `LTRIM`):
+
+```
+capacity      8 shards x 100,000 ops/s ÷ 2 ops  = 400,000 entries/s
+naive demand  86,806 entries/s at peak          = 4.6x headroom
+```
+
+4.6x looks comfortable. It is wrong, because fanout demand is driven by the **follower
+distribution**, not by the mean. Posts from near-threshold authors — just under the 100,000
+wide/narrow cut in §3.3 — dominate:
+
+```
+one post from a 99,999-follower author = 100,000 entries
+100,000 ÷ 400,000 entries/s            = 0.25 s of the ENTIRE cluster, for one post
+so 4 such posts in the same second saturate every shard
+```
+
+Against 1,736 posts/s at peak, **four** posts is a rounding error. Modelling the mix explicitly
+(the fraction of posts from large-but-narrow authors is my assumption; the prompt gives only a
+mean):
+
+```
+0.2% of posts from authors averaging 60,000 followers:
+  1,736 x 0.002 x 60,000 =  208,332 entries/s
+  1,736 x 0.998 x     50 =   86,631 entries/s
+  total                  =  294,963 entries/s  = 74% of capacity  (headroom 1.4x)
+
+0.1% at 60,000 followers : 190,884 entries/s   = 48% of capacity  (headroom 2.1x)
+0.5% at 20,000 followers : 259,981 entries/s   = 65% of capacity  (headroom 1.5x)
+```
+
+All three plausible mixes land between 1.4x and 2.1x. The mean-based 4.6x is a fiction.
+
+**What it looks like when it breaks.** Not an error — Kafka absorbs it as **consumer lag**. A burst
+of 40 near-threshold posts in one second is 4,000,000 entries, 10 seconds of full-cluster time,
+and every follower of every narrow author in the system waits behind it. Users see "my friend
+posted five minutes ago and it isn't in my timeline". Publish still returns 201 in milliseconds
+(§3.3 step 4), so nothing alerts unless lag is the thing being watched.
+
+**What I do about it.**
+
+1. **The wide/narrow threshold is a runtime dial, not a constant.** It is the only parameter that
+   converts write amplification into read amplification, and it can be moved while the system is
+   running. Dropping it from 100,000 to 25,000 removes every near-threshold author from the push
+   path — the 0.2%/60,000 mix above falls from 295k to ~87k entries/s — at the cost of more
+   accounts in each viewer's `wide_followees` set, which is bottleneck #4 and has 3x headroom to
+   spend. **Shedding into a bottleneck with more headroom is the whole point of the hybrid.**
+2. **Alert on fanout lag, not on CPU.** Page at p99 fanout lag > 30 s (§10).
+3. **Two consumer lanes**, partitioned by author size: small authors (< 5,000 followers, the vast
+   majority of posts) never queue behind a 100,000-follower expansion. Costs nothing but a
+   partitioning rule; without it, one big author adds seconds of latency to thousands of small ones.
+4. **Shard for headroom, not just for memory.** 16 shards × 24 GB doubles ops capacity to 800k
+   entries/s for the same RAM. This is the cheap move and it is why the cluster is sized in shards
+   rather than in nodes.
+
+### 7.3 Second: post cache hit rate, and the post store behind it
+
+Every timeline read hydrates by ID (§3.4 step 5), so the hydration rate is 20x the request rate:
+347,222 post reads/s at peak. The post cache holds a ~48 h window, ~100M posts at ~700 B ≈ 70 GB
+(§4.4). Reverse-chronological timelines are recency-concentrated, so I assume a 95% hit rate. The
+exposure is that **the miss rate, not the hit rate, is the load**:
+
+```
+hit 95% : 347,222 x 0.05 = 17,361 reads/s on the post store
+hit 90% : 347,222 x 0.10 = 34,722 reads/s     (2x, for a 5-point drop)
+hit 85% : 347,222 x 0.15 = 52,083 reads/s     (3x)
+```
+
+The post store is sized for 1,736 writes/s plus ~25k reads/s. A five-point change in a parameter I
+assumed rather than measured doubles its read load. Three things move that parameter and none of
+them are traffic growth:
+
+- **Deep pagination.** Past 800 entries the read falls through to the author index (§4.7) and
+  those posts are older than 48 h — a ~0% hit rate for that page.
+- **A cache flush or a cold shard.** A rolling restart puts 100% of hydration on the post store:
+  347k reads/s, 14x its sizing. This is the failure §4.4 refers to.
+- **Edits.** Every edit invalidates one key (§11.2); volume is small, but each invalidation is a
+  miss on a post that is by definition in the hot window.
+
+**What I do about it.**
+
+1. **Never fill a cold cache from live traffic.** New cache nodes are warmed from the post store at
+   a controlled rate before joining the ring, and restarts are one shard at a time.
+2. **Per-request hydration budget with partial results.** A hydration that cannot complete returns
+   the posts it has plus `degraded: true` (§5.1) rather than a 503 for the page. Rendering 17 of 20
+   posts beats rendering an error.
+3. **Concurrency limit on post-store reads, shared across the timeline fleet**, so a hit-rate
+   collapse sheds load instead of taking the store down and turning a slow timeline into no
+   timeline.
+4. **Measure the hit rate as an SLI and alert below 92%** — it is the leading indicator for this
+   whole bottleneck, and it is currently an assumption (§13).
+
+### 7.4 Third: search index freshness
+
+The 5 s freshness requirement is a **latency budget**, not a throughput one, which is why it breaks
+at 2x rather than at capacity. The budget:
+
+```
+publish → outbox → Kafka        ~200 ms
+indexer consume + transform     ~300 ms
+OpenSearch refresh_interval     1,000 ms  (worst case; §4.11)
+replication + query visibility  ~500 ms
+                        total   ~2.0 s of the 5 s budget
+                        slack   ~3.0 s
+```
+
+Throughput is easy: 1,736 docs/s at peak against a hot shard set that handles ~3,500 docs/s. The
+SLO breaks first, and it breaks on **lag**, from three sources: a segment-merge pause on today's
+time-sliced index, an edit storm re-indexing existing documents, or a single slow consumer holding
+a partition. Any of those spends the 3 s slack in one go.
+
+**What I do about it.** Measure freshness end-to-end rather than inferring it: the indexer stamps
+`indexed_at`, a synthetic prober publishes a post every 10 s and searches for it, and the SLO is
+"p99 publish-to-searchable < 5 s" (§10). Edits go to a separate consumer group from publishes, so
+re-indexing never delays first-time visibility — a new post missing its 5 s window is a broken
+promise, an edit appearing at 8 s is not. Today's index carries more primary shards than the
+archive slices, so the hot shard is never the merge bottleneck.
+
+### 7.5 The next three, more briefly
+
+**Read-time merge amplification (#4).** Each wide account a viewer follows adds one bounded range
+read to the author index per page (§3.4 step 2). At 50 followees averaging 0–3 wide, the merge is
+cheap. It stops being cheap around 10 wide followees, and 7.2's mitigation — dropping the
+threshold — pushes it in exactly that direction. The two bottlenecks are coupled, and the coupling
+is the thing to watch: the dial has a range, not a direction. Bound it by capping the pull set per
+request (newest N wide followees, the rest served on refresh) and by caching each wide author's
+recent-ID list — 20,000 wide accounts × 1,000 IDs × 24 B ≈ 480 MB, so it fits everywhere and the
+merge reads memory, not Cassandra.
+
+**Purge throughput (#5).** A 3M-follower account deleting is 3M timeline entries, but the budget is
+24 h: 3,000,000 ÷ 86,400 ≈ **35 deletes/s**, which is nothing. Purge is safe because of the
+tombstone filter (§3.4 step 4) doing the user-visible work immediately. The real risk is
+**correlated** deletion — a bot purge removing 100,000 accounts at once — where the aggregate walk
+of follower partitions competes with live fanout. Purge workers therefore run with an explicit rate
+cap and a lower priority than fanout; the 24 h budget is what buys the right to deprioritise them.
+
+**Image egress (#6).** 15% of posts carry an image, so a 20-post page delivers ~3:
+
+```
+500,000,000 pages/day x 3 images x 200 KB = 300 TB/day = 3.47 GB/s, 10.4 GB/s at peak
+origin at 95% CDN hit rate  = 15 TB/day
+origin at 98% CDN hit rate  =  6 TB/day
+```
+
+This is the largest number in the system by an order of magnitude, and it never touches a service I
+operate: uploads go client → object store directly, reads go CDN → object store (§3.3 step 1,
+§4.12). The scaling work here is cache policy, not capacity — immutable content-addressed variant
+URLs, long max-age, and a fixed set of variant sizes so the CDN's key space stays small. A 3-point
+drop in CDN hit rate costs 9 TB/day of origin egress, which is a bill rather than an outage.
+
+### 7.6 What does not break
+
+Worth naming, because it is where the design spent its complexity budget. Publish latency is
+independent of follower count (201 returns before fanout, §3.3 step 4), so the skew case cannot
+slow down the write path. Post and revision storage grows linearly and additively at ~1.62 TB/month
+at RF 3 (§4.3) with no read amplification. Edits are O(1) regardless of how many timelines
+reference the post, because no timeline stores a body (§11.2) — the same property that makes purge
+a background job. None of these three has a cliff; they have a bill.
+
 ---
 
 ## 8. Failure modes and reliability
