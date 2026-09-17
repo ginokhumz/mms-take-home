@@ -139,6 +139,13 @@ consistency: if the code and the document disagree, both lose marks.
 Debrief will ask: why this state approach, what happens when the optimistic write races "load
 more", and what changes if the contract gains a field. Have answers.
 
+**Code comments cite the contract, never the planning docs.** `§5.0`, `§5.5`, `§3.3` and the like
+point at `DELIVERABLE.md` and stay — they are the evidence that the code implements the document,
+which is the highest-weighted mark. References to `PLAN.md`, `BUILD-PLAN.md` or `SPEC.md` do not
+belong in shipped code: those files are scaffolding for building it, not part of the artefact, and
+a reader of the frontend should never be sent to a plan to understand a line. Keep the reasoning,
+drop the pointer — write the argument out in prose instead.
+
 ## Useful tools and skills for Section 01
 
 | Tool / skill | Use it for |
