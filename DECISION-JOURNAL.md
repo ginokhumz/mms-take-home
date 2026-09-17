@@ -59,6 +59,8 @@ the earlier sections were wrong, which is the point of doing it after §5 rather
 **Thursday, about 00:40** Wrote the Decision records section.
 
 **Thursday, about 21:00** Start on front end build plan docs
+
+**Thursday, about 22:30** Start on FE build
 ---
 
 ## Changes of mind
