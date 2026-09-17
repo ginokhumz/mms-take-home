@@ -1915,30 +1915,285 @@ claiming something it has not done.
 
 ## 11. Decision records
 
-**This section is heavily weighted.** Write one record for each of the five decisions below. Use
-the template exactly.
+### 11.1 Fanout strategy
 
-For each record, "the numbers that forced it" must cite specific figures from `PROMPT.md` or from
-your own section 2 arithmetic. A record that cites no number scores zero for that record.
+> **Decision.** Hybrid, split by follower count at a threshold of **100,000**. Authors below the
+> threshold (*narrow*) are fanned out at write time into per-user Redis lists holding
+> `(post_id, author_id)` and nothing else. Authors at or above it (*wide*) are **not fanned out at
+> all**; their posts are merged in at read time from the author index (§3.3 step 5, §3.4 step 2).
+> The threshold is a runtime dial, not a compile-time constant.
+>
+> **Alternative rejected.** Pure write-time fanout for everyone, with the skew case absorbed by
+> throwing partitions at it — the classic "push to all followers, accept that celebrities are
+> expensive" design. It is the simpler system: one code path, one store on the read side, no
+> merge, no `wide_followees` set, and the read becomes a single `LRANGE`. I rejected it on the
+> write side, not the read side.
+>
+> **The numbers that forced it.**
+>
+> ```
+> average demand   579 posts/s x 50 followers          =  28,935 entries/s
+>                  x3 peak                             =  86,806 entries/s
+> cluster capacity 8 shards x 100,000 ops/s / 2 ops    = 400,000 entries/s   (§7.2)
+>
+> one post, 3,000,000-follower author  = 3,000,000 entries
+>   ÷ 400,000 entries/s                = 7.5 s of the ENTIRE cluster, for one post
+>   ÷ 28,935 entries/s                 = 104 s of the average fanout budget (§3.1)
+> ```
+>
+> The prompt's own two figures are what force the split: 50 average followers and a top 0.1% each
+> exceeding 1,000,000. One post from the tail costs 20,000x the mean post, and §2.1 shows the two
+> figures cannot describe the same population at all. A single strategy sized for the mean is
+> destroyed by the tail; a single strategy sized for the tail is 20,000x oversized for the 99.9%.
+>
+> **Where 100,000 comes from**, since an asserted threshold is worth nothing in a debrief. I set it
+> by a budget rule: *no single post may consume more than a quarter of one cluster-second of
+> fanout*, because at 1,736 posts/s peak, four posts colliding in the same second is routine and
+> four full cluster-seconds is not survivable.
+>
+> ```
+> 0.25 x 400,000 entries/s = 100,000 followers   <- the threshold
+> at 16 shards (800,000/s)  = 200,000 followers   <- what the dial buys when resharded
+> ```
+>
+> The read side then has to be able to afford what the write side sheds. §3.4 assumes 0–3 wide
+> accounts in a viewer's 50 followees, which is the same as assuming wide accounts hold about
+> `50 x 5% = 2.5` of an average viewer's follow edges. That is an assumption, not a derivation, and
+> it is the one I would attack first (§13).
+>
+> **What this costs.** Two read paths instead of one, so every timeline read does a k-way merge and
+> the API has to keep one cursor meaningful against both sets (§5.3). A `wide_followees` set per
+> user that has to be kept current on follow/unfollow. Ordering that depends on time-ordered post
+> IDs being comparable across the push and pull sets — if IDs ever stop being monotonic the merge
+> is wrong, not just slow. And the coupling named in §7.5: lowering the threshold to protect
+> fanout moves load into the read-time merge, so the dial has a range rather than a safe direction.
+>
+> **What would change my mind.** Two observations, in opposite directions. If p99 home-timeline
+> latency crosses 400 ms (§10.2) with the merge — not hydration — dominating the trace, the
+> threshold is too low and wide accounts should be partially materialised into a shared
+> "celebrity list" that viewers read once. If fanout lag p99 crosses 30 s at a threshold already
+> dialled down to ~25,000, push has stopped paying for itself at any setting and the honest move
+> is read-time merge for everyone, with per-author recent-ID lists cached in memory — the 480 MB
+> figure in §7.5 suggests that is affordable for far more than 20,000 authors.
 
-### Template
+### 11.2 Edit propagation
 
-> **Decision:** what you chose.
-> **Alternative rejected:** one real alternative, described well enough that it is clear you
-> considered it.
-> **The numbers that forced it:** the specific figures that made the choice.
-> **What this costs:** what you gave up, stated plainly.
-> **What would change my mind:** the observation or measurement that would make you switch.
+> **Decision.** Timelines store **references, never copies**: a timeline entry is
+> `(post_id, author_id)`, 24 bytes, and the body is fetched by ID at hydration (§3.4 step 5). An
+> edit inside the 15-minute window therefore touches exactly three things — append
+> `post_revisions` row N+1, update `posts.text`/`revision`/`edited_at`, and `DEL post:{post_id}`
+> from the post cache. **No timeline is rewritten, and no timeline is even read.** Every timeline
+> that references the post picks up the new revision on its next hydration.
+>
+> **Alternative rejected.** Denormalise the rendered post body into each timeline entry, so a
+> timeline read is one range scan with no hydration step. Edits then become a second fanout: walk
+> the author's followers again and rewrite every copy. This is a real design — it is what you do
+> when read amplification is the thing you cannot afford — and it makes the read path dramatically
+> cheaper.
+>
+> **The numbers that forced it.**
+>
+> ```
+> edit volume (assumed 5% of posts edited, 1.4 edits each, §6.3):
+>   50,000,000 x 0.05 x 1.4 = 3,500,000 edits/day = 40.5 edits/s, 121/s at 3x peak
+>
+> cost per edit, references:    1 row write + 1 revision row + 1 cache DEL  = O(1)
+> cost per edit, copies:        40.5 x 50 average fanout = 2,025 rewrites/s (average case)
+>   one edit by a 3,000,000-follower account = 3,000,000 rewrites
+>     ÷ 400,000 entries/s = 7.5 s of the entire timeline cluster, for one edit
+> ```
+>
+> The 15-minute window is what makes the copies option worse than it first looks: the edit lands
+> while the original fanout of the same post may still be draining, so the rewrite races the write
+> it is trying to correct, and correctness now depends on ordering two multi-million-entry jobs
+> against each other. With references there is no race to lose — the post row is the single copy,
+> and §12 walks exactly this case.
+>
+> Storage agrees: revisions cost `107M rows/month x 355 B = 38 GB/month`, 7% on top of posts
+> (§6.3), against a materialised timeline set of 384 GB that would have to hold bodies instead of
+> IDs — `20M x 800 x 700 B = 11.2 TB` if entries carried rendered posts, versus 384 GB at 24 B.
+> The reference design is ~29x smaller and is what keeps timelines in RAM at all.
+>
+> **What this costs.** Read amplification of 20x: every page of 20 posts is 20 hydrations, which is
+> `347,222 post reads/s at peak` (§7.0) and is the entire reason the post cache exists and is
+> bottleneck #2 (§7.3). I have converted a write-side cost I cannot bound (fanout of an edit by a
+> 3M-follower account) into a read-side cost I can bound and cache — but a 5-point drop in cache
+> hit rate doubles post-store reads, so the bill is real. It also means a *reader mid-page* can see
+> two revisions of the same post in one session, because hydration happens per page (§12).
+>
+> **What would change my mind.** If the post cache hit rate cannot be held above 92% in production
+> (§7.3's alert threshold), hydration is more expensive than I priced it, and the answer is to
+> denormalise the body into timeline entries **for narrow authors only** — they are the ones whose
+> edits are cheap to re-walk — while wide authors stay reference-only. That is a hybrid on the same
+> axis as §11.1 and it is deliberately the same shape. I would also switch if the edit window were
+> widened from 15 minutes to something unbounded, because "edit a two-year-old post" turns a
+> bounded backfill into an unbounded one under either scheme, and the reference design's O(1) edit
+> would become the only viable one — i.e. that change reinforces this decision rather than
+> reversing it.
 
-### The five decisions
+### 11.3 Search freshness
 
-1. **Fanout strategy.** Write-time fanout, read-time merge, or a hybrid.
-2. **Edit propagation.** What happens to timelines and caches when a post is edited inside the
-   15 minute window.
-3. **Search freshness.** How a post becomes searchable within 5 seconds.
-4. **Deletion purge.** How an account deletion removes that user's posts from every timeline
-   within 24 hours.
-5. **Image handling.** Upload, storage, resizing, delivery and lifecycle.
+> **Decision.** The search indexer is an independent consumer group on the same event log that
+> feeds fanout (§3.3 step 6). It consumes `post.published`, transforms to the §6.7 document, and
+> writes to OpenSearch with `refresh_interval: 1s` on today's time-sliced index. Publishes and
+> edits are consumed by **separate consumer groups** so a re-index storm cannot delay first-time
+> visibility. Freshness is measured end to end by a synthetic prober, not inferred from lag.
+>
+> **Alternative rejected.** Index synchronously from the post service inside the publish request —
+> write the post row, then call OpenSearch, then return 201. It is far simpler, it removes a whole
+> pipeline, and it makes the 5-second requirement trivially true because indexing has *already*
+> happened when the client gets its response.
+>
+> **The numbers that forced it.** The budget, against the prompt's 5 s:
+>
+> ```
+> publish -> outbox -> Kafka        ~200 ms
+> indexer consume + transform       ~300 ms
+> OpenSearch refresh_interval     1,000 ms  (worst case)
+> replication + query visibility    ~500 ms
+>                     total        ~2.0 s of 5 s   ->  3.0 s slack   (§7.4)
+>
+> throughput 1,736 docs/s at peak vs ~3,500 docs/s hot shard set  = 2x headroom
+> ```
+>
+> 2.0 s of a 5 s budget is what says asynchronous is *good enough* — there is no need to pay for
+> synchronous indexing to hit the requirement. And the cost of synchronous is priced by the write
+> rate: at 579 posts/s average and 1,736/s at peak, putting OpenSearch on the publish path means
+> **50,000,000 posts/day** become unpublishable whenever the search cluster is degraded, and
+> publish p99 inherits a search cluster's tail latency — a segment merge pause of 2 s becomes 2 s
+> of publish latency for every user. §4.11 states the property this protects: search can be down
+> and timelines and publishing are unaffected.
+>
+> The 1 s refresh interval is the single largest term in the budget and it is a deliberate buy: it
+> costs more frequent segment creation and merge pressure on today's index, which is why today's
+> slice carries more primary shards than the archive slices (§7.4).
+>
+> **What this costs.** Search is eventually consistent with the post store, by up to ~2 s in the
+> good case and by however far the indexer is behind in the bad case — a 10-minute indexer stall is
+> 1.04M documents that take 590 s to drain at the 1,764 docs/s surplus (§8.2), so a 10-minute
+> outage is a ~20-minute freshness violation. A user can publish, immediately search for their own
+> post, and not find it. There is no read-your-own-writes guarantee on search, and I have not built
+> one (the alternative — querying the post store for the author's own recent posts and unioning —
+> is noted in §14, not designed).
+>
+> **What would change my mind.** If the measured p99 publish-to-searchable sits above 4 s — 80% of
+> the budget — with the slack spent on refresh rather than on lag, I would move today's index to
+> per-document refresh-on-write for new posts only, accepting the indexing throughput cost, since
+> edits and archives do not need it. If instead the violations correlate with consumer rebalances,
+> the fix is pipeline shape rather than refresh policy: more partitions and sticky assignment. The
+> distinction is exactly why the prober measures the end-to-end number rather than trusting the
+> budget above.
+
+### 11.4 Deletion purge
+
+> **Decision.** Two phases with different deadlines. **Synchronously**, at the delete call: block
+> login, hide the profile, and add the author to the replicated tombstone set, which the timeline
+> read path consults *before* hydration (§3.4 step 4) and search consults on query. The posts are
+> invisible everywhere within tombstone replication time (~1 s), not within 24 hours.
+> **Asynchronously**, the purge workers consume `account.deleted` and physically remove posts,
+> revisions, timeline entries, search documents, media objects and follow edges, walking the
+> author's follower buckets with a per-bucket checkpoint and delete-if-present semantics. The
+> tombstone entry is retired only on verified completion of every store, never on a timer.
+>
+> **Alternative rejected.** Purge synchronously and skip the tombstone entirely — the delete call
+> does the work, and when it returns, the data is genuinely gone. This is the design that is
+> easiest to defend to a regulator, and it has no leak-a-tombstone failure mode.
+>
+> **The numbers that forced it.**
+>
+> ```
+> deleting a 3,000,000-follower account = 3,000,000 timeline entries
+>   synchronous: 3,000,000 ÷ 400,000 entries/s = 7.5 s of the ENTIRE timeline cluster
+>                inside one HTTP request, while live fanout starves
+>   async:       3,000,000 ÷ 86,400 s          = 34.7 deletes/s   <- the 24 h budget
+>
+> work unit: 3,000,000 ÷ 10,000 edges per bucket (§6.6) = 300 buckets, checkpointed
+> tombstone set: 20,000,000 x 0.01%/day = 2,000 entries x 8 B  = 16 KB, held ≤ 24 h
+> filter cost: one set membership check per hydrated post, 347,222/s at peak, in RAM
+> ```
+>
+> The prompt gives 24 hours for the purge. 34.7 deletes/s against a cluster doing 400,000
+> entries/s is **0.009% of capacity** — that is what the 24-hour budget buys, and it is why purge
+> can be rate-capped and run at lower priority than fanout (§7.5). But 24 hours is an unacceptable
+> answer to "my posts are still showing", so the tombstone does the user-visible work in ~1 s at a
+> cost of 16 KB replicated to every timeline service instance. The two-phase split exists because
+> the *promise* and the *cleanup* have deadlines three orders of magnitude apart.
+>
+> **What this costs.** A filter check on every hydrated post forever — 347,222/s at peak — for a
+> feature that fires 2,000 times a day. A correctness rule that is easy to get wrong in the unsafe
+> direction: retiring a tombstone early un-deletes a user's posts, so a stuck purge must leak
+> rather than expire (§8.6). And an honest limit on the word "purge": the event log retains bodies
+> for 7 days and backups for 30 (§9.6), both longer than 24 hours, so the promise is about the
+> serving path, not about every byte in the estate. I chose to write that down rather than claim
+> crypto-shredding I have not designed.
+>
+> **What would change my mind.** A legal requirement for hard deletion inside an hour would kill
+> this design outright — no amount of tombstoning satisfies "the bytes are gone" — and the answer
+> would be per-user encryption keys with key destruction, which changes the storage layer, not the
+> purge job. Short of that: if the daily deletion rate rose 50x to 0.5% of actives (100,000
+> accounts/day, a bot purge), the tombstone set is still only 800 KB, but the aggregate purge walk
+> starts competing with live fanout, and I would move purge onto its own timeline-store replica so
+> the two never share op budget.
+
+### 11.5 Image handling
+
+> **Decision.** The image never touches a service I operate on the way in or the way out.
+> `POST /v1/media` returns a presigned `PUT` scoped to one key, 15-minute expiry, with a
+> `content-length-range` of 1–2,097,152 bytes; the client uploads **directly to the object store**.
+> The media service then validates by magic bytes, re-encodes into two immutable WebP variants
+> (1280 and 640), and emits `media.ready`. The post row stores a `media_id` UUID and no URLs;
+> publish returns `409 media_not_ready` if the state is not `ready`. Delivery is
+> CDN → object store on a separate cookieless domain. Lifecycle: originals retained unserved for
+> the purge to delete, orphan rows collected after 24 h.
+>
+> **Alternative rejected.** Multipart upload through the API gateway to the post service, which
+> stores the bytes and serves them back. One request instead of three, no two-phase publish, no
+> `media_not_ready` state to reason about, and the post and its image become atomic — which is
+> genuinely nicer for the client and for §12-style traces.
+>
+> **The numbers that forced it.** At the prompt's 2 MB cap and an assumed 15% image attach rate:
+>
+> ```
+> ingress if uploads traverse the API tier:
+>   1,736 posts/s peak x 15%          =   260 uploads/s
+>   x 2 MB                            =   521 MB/s = 4.2 Gbit/s into the request tier
+>                                       (against a tier whose real job is ~17,361 req/s of JSON)
+>
+> storage:  50,000,000 x 15% = 7,500,000 images/day = 225,000,000/month
+>           x 1.2 MB x 1.5 (original + 2 variants)  = 405 TB/month   (§4.12)
+>
+> egress:   500,000,000 pages/day x 3 images x 200 KB = 300 TB/day = 3.47 GB/s, 10.4 GB/s peak
+>           origin at 98% CDN hit rate               = 6 TB/day     (§7.5)
+> ```
+>
+> 405 TB/month is the dominant storage cost in the system by two orders of magnitude — posts and
+> revisions together are 1.62 TB/month at RF 3 (§4.3) — and 300 TB/day of egress is the largest
+> number anywhere in this document. Neither figure is one I want flowing through a stateless
+> service tier I have to scale, deploy and page someone about. Sizing the API tier for 4.2 Gbit/s
+> of image ingress means sizing it for a workload that has nothing to do with its latency SLO.
+>
+> Fixed variant sizes are part of the same arithmetic: a small key space is what keeps the CDN hit
+> rate high, and **3 points of CDN hit rate is 9 TB/day of origin egress** (§7.5) — a bill, not an
+> outage, but a bill that on-demand resizing would hand over voluntarily.
+>
+> **What this costs.** A three-step publish for the client (presign, PUT, post) and a state machine
+> — `presigned → uploaded → ready | rejected` — that leaks into the API as `409 media_not_ready`
+> and into the frontend as a race the optimistic insert has to handle. Orphan media rows that need
+> a collector. No image editing: §1.3 fixes the attachment at publish time, so the edit window
+> covers text only, which is a product limitation I chose rather than one I was given. And
+> validation after the fact rather than at the door — the bytes are in my bucket before I know they
+> are an image, which is why §9.4 rejects SVG, caps decode at 8,192 x 8,192 and sandboxes the
+> decoder.
+>
+> **What would change my mind.** If the attach rate turned out to be 40% rather than the assumed
+> 15%, storage is 1.08 PB/month and egress ~800 TB/day, and the decision that changes is not the
+> upload path — it is retention: originals would stop being kept indefinitely and would expire to
+> cold storage after 30 days, since they are never served. If CDN hit rate could not be held above
+> 95%, I would add a second variant tier and shorten the variant list further before touching
+> origin capacity. The upload path itself would only change if a product requirement forced
+> server-side processing the client cannot be trusted with at all — image moderation on the
+> critical path, for instance — and even then the right move is to keep the direct upload and gate
+> `media.ready`, not to route 4.2 Gbit/s through the gateway.
 
 ---
 
