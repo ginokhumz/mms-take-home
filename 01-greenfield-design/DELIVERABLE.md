@@ -61,22 +61,16 @@ Priority is set by how often each thing happens and how badly users notice when 
 
 ## 2. Capacity estimation
 
-Show the arithmetic. Every figure gets its working.
+Every figure below is derived from the constraint table in §1 or from an assumption stated at the
+point it is used. Two assumptions carry most of the weight and are named here so they can be
+attacked directly:
 
-Cover at least:
+| Assumption | Value | Where it comes from |
+|---|---|---|
+| **Peak multiplier** | **3x the 24-hour mean** | A single-region product concentrates traffic into roughly an 8-hour band. Every "peak" figure in this document is a mean multiplied by 3 |
+| **Timeline sessions per active user per day** | **25** | The read side of the system. Chosen, not derived — the prompt withholds the read-to-write ratio. Justified and cross-checked in §2.6, and it is the parameter I attack in §13.3 |
 
-- Write rate in posts per second, average and peak. State the peak multiplier you assume.
-- Fanout writes per second at the average fanout.
-- The skew case: what one post from an account with over 1 million followers costs, and what that
-  does to your write path.
-- Storage per month: post bodies, images, edit history, materialised timelines, search index.
-  Treat each separately and state the assumptions behind each.
-- **Your read-to-write ratio, stated explicitly**, and the read load in requests per second that
-  follows from it. Say how you chose the ratio and cross-check it against per-user behaviour.
-- Egress bandwidth for images, and what it implies for caching.
-
-If two constraints in the prompt do not reconcile arithmetically, show the calculation that proves
-it and state the reading you adopt.
+The derived month is 30.44 days, so 50,000,000 posts/day = **1.522 billion posts/month**.
 
 ### 2.1 Average fanout and follower skew do not reconcile
 
@@ -95,9 +89,189 @@ Both figures cannot describe the same 20M users.
 - "Average fanout 50" is the number of **active timelines one post is written into**, averaged over
   posts. Most posts come from small accounts, which keeps the per-post average low.
 
+**This reading has a second horn, and I would rather name it than let it sit.** The constraint says
+*top 0.1% of **accounts***, and the calculation above reads "accounts" as the 20 million active
+users. But the reading I just adopted introduces 500 million registered accounts — which changes
+the denominator of the very figure it was introduced to explain:
+
+```
+0.1% of  20,000,000 active     =  20,000 accounts x 1M =  20,000,000,000 edges =  20x the 1B active edges
+0.1% of 500,000,000 registered = 500,000 accounts x 1M = 500,000,000,000 edges = 500x
+```
+
+So the reconciliation is self-referential: the assumption that makes 1M-follower counts possible
+also multiplies the number of accounts that must have them, by 25. There is no reading of the
+constraint table that makes both rows comfortable — the tension is in the table, not in my
+arithmetic, and the honest answer is that "accounts" is doing two different jobs in two rows.
+
+**I design against the 20,000 figure**, for two reasons. It is the conservative choice for the
+decision the number actually drives: fewer wide accounts means more posts stay on the push path,
+so a fanout budget sized against 20,000 is not flattered by the assumption. And 0.1% of the
+population the rest of the table describes — active users — is the reading that keeps one meaning
+of "accounts" throughout §§3–12.
+
+The 500,000 reading does not break the design; it makes the read side worse, not the write side.
+It implies 1,000 wide followees per viewer rather than 40, against the 0–3 that §3.4 assumes.
+Either way that assumption fails, which is why it is §13.1 and not a footnote here.
+
 **What this does to the write path:** pushing one post from a 1M-follower account means ≥ 1M
 timeline writes for one post, 20,000× the average post's 50. Large accounts are therefore not
 fanned out at write time (§11.1).
+
+### 2.2 Write rate
+
+```
+posts           50,000,000/day ÷ 86,400        =      579 posts/s
+at 3x peak      578.7 x 3                      =    1,736 posts/s
+per user        50,000,000 ÷ 20,000,000        =      2.5 posts/active user/day
+```
+
+2.5 posts per active user per day is the sanity check on the constraint: it is high for a general
+population and normal for the engaged subset a "20 million active users" figure describes. I take
+the 50M/day as given rather than rederiving it.
+
+Each publish is four writes to four partitions (§6.12), so the store-level write rate is ~2,300/s
+average and ~6,900/s at peak — still small. **The write path is not where this system is hard.**
+
+### 2.3 Fanout writes
+
+At the constraint's average fanout of 50:
+
+```
+average         578.7 posts/s x 50 followers   =   28,935 timeline entries/s
+at 3x peak      x 3                            =   86,806 timeline entries/s
+per day         50,000,000 x 50                = 2.5 billion timeline writes/day
+```
+
+This is the figure the timeline cluster is sized against in §7.2, and it is 50x the post rate.
+Fanout, not publishing, is the write-side cost of the system.
+
+**Aggregate fanout is `posts/s × mean fanout` identically.** A different follower distribution
+changes burstiness and queueing — which is a real problem, priced in §7.2 — but it cannot change
+this total. Where §7.2 models mixes implying a mean of 110–170, it is inconsistent with this
+constraint; the honest aggregate is 86,806 entries/s and the risk is latency, not throughput.
+
+### 2.4 The skew case
+
+One post from a 1,000,000-follower account, against the 400,000 entries/s timeline cluster
+*ceiling* derived in §7.2 (the sustainable operating figure is ~254,000 entries/s; §7.2 keeps the
+two apart, and the ratios below hold either way):
+
+```
+average post    50 entries      ÷ 400,000/s    =  0.000125 s of the cluster
+1M-follower     1,000,000       ÷ 400,000/s    =      2.5 s of the ENTIRE cluster
+3M-follower     3,000,000       ÷ 400,000/s    =      7.5 s of the ENTIRE cluster
+ratio                           1,000,000 / 50 =  20,000x the average post
+```
+
+At 1,736 posts/s at peak, a post that occupies every shard for 2.5 seconds is not survivable: the
+entire system's fanout stops while one celebrity's followers are written. **This single number is
+what forces the hybrid in §11.1** — write-time fanout for narrow accounts, read-time merge for
+wide ones — and it is why the wide/narrow threshold is derived from a cluster-second budget rather
+than picked.
+
+**A caveat I have to name.** The figures above use nominal follower counts, while §2.1 adopts the
+reading that those counts include inactive registered accounts. Applied consistently, a
+1M-follower account has 1,000,000 × 4% = 40,000 *active* followers and costs 0.1 cluster-seconds,
+not 2.5 — a 25x gap. §§7, 11 and 12 currently use the nominal counts. The design survives either
+reading, because the tail is long enough that *some* accounts exceed the threshold on any
+denominator, but the specific numbers in §11.1 and §11.4 are the nominal ones. This is the
+inconsistency I take apart in §13.1 rather than paper over here.
+
+### 2.5 Storage per month
+
+Each category separately, with its assumption stated. Rows sized in §6.2.
+
+| Category | Arithmetic | Per month | Assumption |
+|---|---|---|---|
+| **Post bodies** | 1.522B × 355 B | **540 GB raw, 1.62 TB at RF 3** | 222 B of fields × 1.6 wide-column overhead; 140-char average body against the 500-char cap (§6.2) |
+| **Edit history** | 1.522B × 5% × 1.4 × 355 B = 107M rows | **38 GB raw, 114 GB at RF 3** | 5% of posts are edited, 1.4 edits each. Both are guesses (§6.3). 7% on top of post bodies |
+| **Images** | 228.3M × 1.2 MB × 1.5 | **411 TB** | 15% of posts carry an image; 1.2 MB average against the 2 MB cap; 1.5x for original + 2 resized variants. Object store, no RF 3 multiplier — erasure coding is ~1.4x, folded in |
+| **Search index** | 1.522B × 210 B × 2.3 | **0.74 TB per replica** | 210 B indexed per doc; 2.3x for the inverted index and doc values (§6.7) |
+| **Materialised timelines** | 20M × 800 × 24 B | **384 GB — fixed, not monthly** | 800 entries per user, 24 B per `(post_id, author_id)` entry. A bounded ring buffer, so it does not grow with time — only with user count (§4.7) |
+
+```
+durable growth/month  1.62 TB (posts) + 0.11 TB (revisions) + 0.74 TB (search) = 2.47 TB
+                    + 411 TB (images)
+                                                               total ≈ 413 TB/month
+```
+
+**Images are 99.4% of the storage bill and two orders of magnitude above everything else.** That
+single ratio is why images never transit a service I operate (§11.5): the bytes go client → object
+store → CDN, and the post store holds a 16-byte `media_id`. Timelines being a fixed 384 GB rather
+than a monthly accrual is the other deliberate result — it comes from storing IDs and never
+bodies, which §11.2 shows would have been 11.2 TB instead.
+
+### 2.6 Read load and the read-to-write ratio
+
+**The prompt withholds this ratio deliberately, so I state it: 12.4 : 1.** It is built from
+per-user behaviour rather than asserted as a round number:
+
+```
+home timeline   20,000,000 actives x 25 sessions/day        =  500,000,000/day
+profile + permalink views (assumed 5/user/day)              =  100,000,000/day
+search queries (assumed 1/user/day)                         =   20,000,000/day
+                                                     total  =  620,000,000 reads/day
+writes                                                      =   50,000,000/day
+ratio                                    620M / 50M         =       12.4 : 1
+```
+
+```
+timeline requests   500,000,000 ÷ 86,400   =   5,787 req/s,   17,361/s at 3x peak
+hydration           500,000,000 x 20 posts = 10,000,000,000 post reads/day
+                                           = 115,741/s,      347,222/s at 3x peak
+```
+
+**How I arrived at 25 sessions/day.** An engaged microblog user opens the app several times a day
+and refreshes within each session; 25 timeline fetches is a handful of sessions with a few
+refreshes each. 12.4 : 1 is deliberately conservative, and the reason is scope rather than
+comparison to any other product: §1.2 puts logged-out reading out of scope, so every read counted
+here is an authenticated read by one of the 20 million active users. A public corpus that
+anonymous traffic could reach would add a read population this design does not model, and the
+ratio would be some multiple of 12.4 : 1. I have not put a figure on that multiple because there
+is nothing in the constraint table to derive one from.
+
+**The cross-check, which is the part that matters.** Deriving 500M/day from 25/day and reading
+25/day back out proves nothing. The real check is against how many posts actually arrive:
+
+```
+post slots consumed   25 requests x 20 posts per page   = 500/day
+posts actually arriving  50 followees x 2.5 posts/day   = 125/day
+re-read factor                                          =   4x
+```
+
+Every post in a viewer's timeline is fetched roughly four times a day. That is consistent with
+refresh-heavy feed behaviour — the same page re-rendered on each app open — but it is a real
+assumption in its own right, and it is the sole driver of the 347,222 hydrations/s that makes the
+post cache a bottleneck in §7.3. **The cross-check passes, but only because of a 4x factor I had
+to name to make it pass.** §13.3 takes this apart, including the sensitivity: at 36 sessions/day
+the post store is over budget, giving 1.4x headroom on a parameter nobody has measured.
+
+### 2.7 Image egress and what it implies for caching
+
+Egress is driven by reads, not by uploads. A 20-post page delivers ~3 images at the 15% rate:
+
+```
+500,000,000 pages/day x 3 images x 200 KB delivered variant = 300 TB/day
+                                        ÷ 86,400            = 3.47 GB/s
+                                        x 3 peak            = 10.4 GB/s
+```
+
+**10.4 GB/s at peak is 83 Gbit/s — the largest number in the system by an order of magnitude**,
+and 740x the 14 MB/s of durable post writes. Serving it from origin is not an option, so the
+design is CDN-first and the only real lever is hit rate:
+
+```
+origin at 95% CDN hit   300 TB x 5%   = 15 TB/day
+origin at 98% CDN hit   300 TB x 2%   =  6 TB/day
+```
+
+Three points of CDN hit rate is 9 TB/day of origin egress. What buys those points is cache-key
+discipline, not capacity: content-addressed immutable variant URLs, a long `max-age`, and a
+**fixed** set of variant sizes so the CDN's key space stays small — an on-the-fly resize API would
+fragment the key space and collapse the hit rate. This is why §11.5 treats the variant set as a
+closed enum rather than a parameter. Unlike every other figure in this section, a miss here is a
+bill rather than an outage (§7.5).
 
 ---
 
@@ -186,7 +360,7 @@ graph TB
 
 1. If the post has an image, the client first calls `POST /v1/media` and receives a presigned URL;
    the 2 MB upload goes **client → object store directly**, never through the API tier. That keeps
-   ~225M images/month (§2) off the request path. The media service emits `media.ready` when the
+   ~228.3M images/month (§2) off the request path. The media service emits `media.ready` when the
    variants are generated.
 2. `POST /v1/posts` with an idempotency key hits the post service. It validates ≤ 500 characters,
    mints a **time-ordered 64-bit post ID** (Snowflake-style: 41-bit ms timestamp, 10-bit shard,
@@ -377,7 +551,7 @@ SLO breaks first and is alerted on before results become visibly wrong (§10).
 **Responsibility.** Issue presigned uploads, validate the finished object (content type by magic
 bytes, size ≤ 2 MB, re-encode to strip metadata), generate variants, emit `media.ready`.
 **Stores.** Object store: originals plus ~2 variants. At 15% of posts carrying an image,
-225M images/month × 1.2 MB × 1.5 ≈ **405 TB/month** (§2) — the dominant storage cost by two orders
+228.3M images/month × 1.2 MB × 1.5 ≈ **411 TB/month** (§2) — the dominant storage cost by two orders
 of magnitude, which is why it never touches the API tier or any database.
 **Scales.** Object store scales on its own; processing workers scale on the queue.
 **Unavailable.** Publish with an image fails at the presign step, before any post exists — so there
@@ -1212,74 +1386,127 @@ first, because that is the component that a bad week, not a bad year, takes out.
 
 | # | Component | Peak demand today | Capacity as designed | Headroom | Breaks when |
 |---|---|---|---|---|---|
-| 1 | Fanout → timeline store | 190k–295k entries/s (see 7.2) | ~400k entries/s | **1.4x** | Posting rate rises ~40%, or the follower mix shifts up |
+| 1 | Fanout → timeline store | 86,806 entries/s, fixed by the constraint (§2.3) | ~254k entries/s sustainable (§7.2) | **2.9x** | Not throughput — burst granularity. One post can consume 0.39 cluster-seconds (§7.2) |
 | 2 | Post cache → post store | 347k hydrations/s, 17.4k/s of misses | ~25k reads/s on the post store | **1.4x** | Cache hit rate falls from 95% to 90% |
 | 3 | Search indexer → 5 s freshness | 1,736 docs/s | ~3,500 docs/s per hot shard set | **2x** | Indexer lag exceeds ~3 s, breaking the SLO before capacity |
-| 4 | Read-time merge (wide followees) | 0–3 wide followees per viewer | ~10 before the merge doubles read latency | ~3x | Wide accounts get more popular, or the threshold drops |
+| 4 | Read-time merge (wide followees) | 0–3 wide followees per viewer — **disputed, §13.1** | ~10 before the merge doubles read latency | ~3x *if* the 0–3 holds | Wide accounts get more popular, or the threshold drops |
 | 5 | Purge of a wide account | 35 deletes/s per account | thousands/s | >50x | Mass-deletion event, not organic growth |
 | 6 | Image egress | 10.4 GB/s at peak | CDN-bound, origin 6 TB/day | high | CDN hit rate drops below ~95% |
 
-Items 1 and 2 are within a factor of 1.5 of their ceiling today. Everything below item 3 is a
-year-two problem.
+**The ordering is not purely by headroom, and I would rather say so than pretend otherwise.** On
+headroom alone the post cache (#2, 1.4x) is tighter than fanout (#1, 2.9x). I keep fanout first
+because headroom is the wrong single lens for it: its demand is fixed by the constraint and cannot
+grow without the posting rate growing, but it fails *silently* — as consumer lag behind a 201
+response — and degrades every timeline in the system at once. The post cache has less headroom and
+a louder, more contained failure. Ranking on headroom alone would put #2 first; ranking on blast
+radius and detectability puts #1 first. Item 2 is the one to fix if you can only fix one, and
+that is exactly what §11 does not currently reflect.
+
+Everything below item 3 is a year-two problem.
 
 ### 7.2 First to break: fanout into the timeline store
 
-**The average fanout figure hides the demand.** The timeline cluster is sized by memory, not
-throughput — 20M × 800 × 24 B ≈ 384 GB (§4.7), which at 48 GB per shard is 8 shards. At ~100k
-simple ops/s per shard and 2 ops per entry (`LPUSH` + `LTRIM`):
+**Fanout is first to break on latency, not on throughput.** An earlier draft of this section
+argued the opposite and was wrong in a way worth recording, because the error is easy to make and
+the correction is the actual insight.
+
+**First, the capacity, corrected.** The timeline cluster is sized by memory — 20M × 800 × 24 B ≈
+384 GB (§4.7), which at 48 GB per shard is 8 shards. The earlier figure spent 100% of the op
+budget on fanout and reserved nothing for reads or for operating headroom:
 
 ```
-capacity      8 shards x 100,000 ops/s ÷ 2 ops  = 400,000 entries/s
-naive demand  86,806 entries/s at peak          = 4.6x headroom
+raw budget        8 shards x 100,000 ops/s              = 800,000 ops/s
+reads             17,361 LRANGE/s at peak (§7.0)
+                  x ~3 simple-op equivalents for 20 elems =  52,083 ops/s   (6.5%)
+usable at 70% target utilisation  800,000 x 0.7 - 52,083 = 507,917 ops/s
+fanout capacity   ÷ 2 ops per entry (LPUSH + LTRIM)      = 253,958 entries/s
 ```
 
-4.6x looks comfortable. It is wrong, because fanout demand is driven by the **follower
-distribution**, not by the mean. Posts from near-threshold authors — just under the 100,000
-wide/narrow cut in §3.3 — dominate:
+**~254,000 entries/s sustainable**, against a 400,000 entries/s *ceiling* that assumes the cluster
+runs flat out with nothing left for reads. Both numbers appear in this document and they are not
+interchangeable: 400,000 is what the hardware can do, 254,000 is what it can be operated at.
+
+**Second, the demand, which the constraint fixes.** Aggregate fanout is `posts/s × mean fanout`
+**identically**. A different follower distribution changes how the work arrives; it cannot change
+how much there is:
 
 ```
-one post from a 99,999-follower author = 100,000 entries
-100,000 ÷ 400,000 entries/s            = 0.25 s of the ENTIRE cluster, for one post
-so 4 such posts in the same second saturate every shard
+demand        1,736 posts/s x 50            =  86,806 entries/s at peak   (§2.3)
+utilisation   86,806 ÷ 253,958              =      34%
+headroom                                    =     2.9x
 ```
 
-Against 1,736 posts/s at peak, **four** posts is a rounding error. Modelling the mix explicitly
-(the fraction of posts from large-but-narrow authors is my assumption; the prompt gives only a
-mean):
+Any mix consistent with the constraint's mean of 50 reproduces the same total:
 
 ```
-0.2% of posts from authors averaging 60,000 followers:
-  1,736 x 0.002 x 60,000 =  208,332 entries/s
-  1,736 x 0.998 x     50 =   86,631 entries/s
-  total                  =  294,963 entries/s  = 74% of capacity  (headroom 1.4x)
-
-0.1% at 60,000 followers : 190,884 entries/s   = 48% of capacity  (headroom 2.1x)
-0.5% at 20,000 followers : 259,981 entries/s   = 65% of capacity  (headroom 1.5x)
+0.10% of posts at 10,000 followers, rest at 40.0  -> mean 50.0 -> 86,800 entries/s
+0.05% of posts at 99,999 followers, rest at  0.0  -> mean 50.0 -> 86,800 entries/s
 ```
 
-All three plausible mixes land between 1.4x and 2.1x. The mean-based 4.6x is a fiction.
+So **2.9x headroom on throughput is real**, and the earlier draft's "1.4x–2.1x" came from three
+modelled mixes that implied mean fanouts of 110, 150 and 170 — 2.2x to 3.4x the figure the prompt
+fixes. That was substituting an invented distribution for a given constraint, which is exactly
+what §2 forbids. Retracted.
 
-**What it looks like when it breaks.** Not an error — Kafka absorbs it as **consumer lag**. A burst
-of 40 near-threshold posts in one second is 4,000,000 entries, 10 seconds of full-cluster time,
-and every follower of every narrow author in the system waits behind it. Users see "my friend
-posted five minutes ago and it isn't in my timeline". Publish still returns 201 in milliseconds
-(§3.3 step 4), so nothing alerts unless lag is the thing being watched.
+**Third, the risk that is real.** The mean fixes the throughput; the *tail* fixes the queueing,
+and fanout work is indivisible. The constraint bounds how lumpy it can get:
 
-**What I do about it.**
+```
+max share of posts from 99,999-follower authors compatible with mean 50
+                        = 50 / 99,999            =  0.050%  ->  0.87 posts/s at peak
+one such post           = 100,000 entries
+                        ÷ 253,958 entries/s      =  0.39 s of the ENTIRE cluster
+duty cycle              0.87 x 0.39              =     34%
+```
 
-1. **The wide/narrow threshold is a runtime dial, not a constant.** It is the only parameter that
-   converts write amplification into read amplification, and it can be moved while the system is
-   running. Dropping it from 100,000 to 25,000 removes every near-threshold author from the push
-   path — the 0.2%/60,000 mix above falls from 295k to ~87k entries/s — at the cost of more
-   accounts in each viewer's `wide_followees` set, which is bottleneck #4 and has 3x headroom to
-   spend. **Shedding into a bottleneck with more headroom is the whole point of the hybrid.**
-2. **Alert on fanout lag, not on CPU.** Page at p99 fanout lag > 30 s (§10).
-3. **Two consumer lanes**, partitioned by author size: small authors (< 5,000 followers, the vast
-   majority of posts) never queue behind a 100,000-follower expansion. Costs nothing but a
-   partitioning rule; without it, one big author adds seconds of latency to thousands of small ones.
-4. **Shard for headroom, not just for memory.** 16 shards × 24 GB doubles ops capacity to 800k
-   entries/s for the same RAM. This is the cheap move and it is why the cluster is sized in shards
-   rather than in nodes.
+The same 34% utilisation — but delivered as 0.87 indivisible 0.39-second lumps per second instead
+of 1,736 small ones. **This is why 34% utilisation does not feel like 34%.** Service time variance,
+not mean utilisation, sets queueing delay: every post behind a 100,000-entry expansion waits for
+it to finish, so p99 fanout lag degrades badly at a utilisation that looks comfortable on a
+dashboard. A cluster at 34% mean utilisation with this service-time distribution is a cluster with
+a latency problem, not a capacity problem.
+
+**What it looks like when it breaks.** Not an error — Kafka absorbs it as **consumer lag**. Ten
+near-threshold posts landing on the same partition within a few seconds is 1,000,000 entries and
+~4 seconds of full-cluster time, and every follower of every small author behind them waits.
+Users see "my friend posted five minutes ago and it isn't in my timeline". Publish still returns
+201 in milliseconds (§3.3 step 4), so nothing alerts unless lag is the thing being watched.
+
+**What I do about it.** The mitigations are unchanged by the correction, but their *ranking* is
+not: the correction promotes head-of-line blocking from third place to first, because queueing is
+now the whole problem rather than a side effect of a throughput shortfall.
+
+1. **Two consumer lanes**, partitioned by author size: small authors (< 5,000 followers, the vast
+   majority of posts) never queue behind a 100,000-follower expansion. **This is now the primary
+   mitigation, not the third one.** It costs a partitioning rule and it directly attacks service
+   time variance, which is the thing actually hurting. Without it, one big author adds seconds of
+   latency to thousands of small ones.
+2. **Chunk wide expansions.** A 100,000-entry fanout is emitted as 20 × 5,000-entry work items
+   that interleave with ordinary posts, so no single post holds a lane for 0.39 s. This converts
+   an indivisible lump into divisible work and is what makes the duty-cycle arithmetic above
+   survivable.
+3. **Alert on fanout lag, not on CPU.** Page at p99 fanout lag > 30 s (§10). CPU will read ~34%
+   throughout, which is precisely why it is the wrong signal.
+4. **The wide/narrow threshold is a runtime dial, not a constant.** It converts write amplification
+   into read amplification and can be moved while running. Dropping it lowers the largest
+   indivisible unit of work — at 25,000 the worst lump is 0.10 s rather than 0.39 s — at the cost
+   of more accounts in each viewer's `wide_followees` set, which is bottleneck #4. Note that §13.1
+   disputes whether #4 has the headroom to absorb that, so this dial is less free than §7.5 claims.
+5. **Shard for headroom, not just for memory.** 16 shards × 24 GB doubles the op budget for the
+   same RAM, halving the cluster-seconds any one post can consume. This is the cheap move and it is
+   why the cluster is sized in shards rather than in nodes.
+
+**Two consequences of this correction that are not yet carried through the document**, recorded
+here rather than left to be discovered:
+
+- **§7.1's ranking.** By the headroom criterion §7.1 states, fanout at 2.9x is no longer the
+  tightest — the post cache at 1.4x is. I have kept fanout at #1 because it fails silently and
+  degrades every timeline at once, but that means the table is ranked on two criteria, not one.
+  Row 1's figures are corrected; the honest ordering question is flagged in §7.1 rather than hidden.
+- **§11.1's threshold derivation.** It derives the 100,000 wide/narrow cut from
+  `0.25 × 400,000 entries/s`. Against the sustainable 254,000 the same budget rule gives ~63,500.
+  I have not re-cut the threshold here because it changes §11.1, §11.4 and §12 together and the
+  decision belongs in the decision record, not in a bottleneck analysis.
 
 ### 7.3 Second: post cache hit rate, and the post store behind it
 
@@ -1437,15 +1664,17 @@ trims naturally. I accept that rather than paying a per-entry existence check on
 **Recovery time for a real backlog.** A five-minute total fanout outage at peak:
 
 ```
-backlog        86,806 entries/s x 300 s          = 26,041,800 entries
-drain surplus  400,000 capacity - 86,806 live    =    313,194 entries/s
-drain time     26,041,800 / 313,194              =         83 s
+backlog        86,806 entries/s x 300 s               = 26,041,800 entries
+drain surplus  253,958 sustainable - 86,806 live      =    167,152 entries/s
+drain time     26,041,800 / 167,152                   =        156 s
 ```
 
-So a 5-minute outage costs ~6.4 minutes of staleness, not 5 minutes of permanent loss. That ratio
-only holds while the cluster has headroom; at the 1.4x headroom of §7.2 the same outage drains in
-`26,041,800 / (400,000 - 294,963) ≈ 248 s`, three times slower. **Headroom is recovery speed** —
-that is the second argument for the 16-shard split in §7.2, independent of steady-state capacity.
+So a 5-minute outage costs ~7.6 minutes of staleness, not 5 minutes of permanent loss. Draining
+against the 400,000 entries/s *ceiling* rather than the 254,000 sustainable figure would give 83 s,
+but a cluster recovering from an outage is exactly where running flat out is least advisable, so
+156 s is the number to plan against. **Headroom is recovery speed** — resharding to 16 shards
+doubles the op budget and drains the same backlog in 58 s, which is the second argument for that
+split in §7.2, independent of steady-state capacity.
 
 **Detection.** Consumer lag per partition, paged at p99 fanout lag > 30 s (§10). Nothing else
 alerts: publish still returns 201 in milliseconds (§3.3 step 4).
@@ -1786,7 +2015,7 @@ the stream for ~30 s:
 
 ```
 30 s × 86,806 entries/s peak            = 2,604,180 entries of backlog
-drain at the §8.1 surplus (313,000/s)   = 8.3 s to catch up
+drain at the §8.1 surplus (167,152/s)   = 15.6 s to catch up
 ```
 
 So a deploy is an 8-second lag spike, invisible against the 30 s alert threshold — *provided*
@@ -2159,14 +2388,14 @@ claiming something it has not done.
 >   x 2 MB                            =   521 MB/s = 4.2 Gbit/s into the request tier
 >                                       (against a tier whose real job is ~17,361 req/s of JSON)
 >
-> storage:  50,000,000 x 15% = 7,500,000 images/day = 225,000,000/month
->           x 1.2 MB x 1.5 (original + 2 variants)  = 405 TB/month   (§4.12)
+> storage:  50,000,000 x 15% = 7,500,000 images/day = 228,300,000/month
+>           x 1.2 MB x 1.5 (original + 2 variants)  = 411 TB/month   (§4.12)
 >
 > egress:   500,000,000 pages/day x 3 images x 200 KB = 300 TB/day = 3.47 GB/s, 10.4 GB/s peak
 >           origin at 98% CDN hit rate               = 6 TB/day     (§7.5)
 > ```
 >
-> 405 TB/month is the dominant storage cost in the system by two orders of magnitude — posts and
+> 411 TB/month is the dominant storage cost in the system by two orders of magnitude — posts and
 > revisions together are 1.62 TB/month at RF 3 (§4.3) — and 300 TB/day of egress is the largest
 > number anywhere in this document. Neither figure is one I want flowing through a stateless
 > service tier I have to scale, deploy and page someone about. Sizing the API tier for 4.2 Gbit/s
@@ -2550,18 +2779,180 @@ that repairs them.
 
 ## 13. Self-critique
 
-**This section is heavily weighted.** Name the three weakest parts of your design.
+All three weaknesses draw on the same budget — the post store's read capacity — and none of them
+is a growth problem. Each is a number I chose rather than derived, sitting at or over its ceiling
+at today's design point.
 
-For each one:
+### 13.1 The read-time merge is sized against the optimistic end of a follower distribution I never measured
 
-- What is weak, stated without hedging.
-- Why you accepted it.
-- **The specific test, experiment or measurement that would expose it.** Name the load, the
-  metric and the threshold at which you would say the design has failed.
+**What is weak.** §3.4, §7.1 row 4, §7.5 and §12 all assume a viewer has **0–3 wide followees**.
+§11.1 concedes this is "an assumption, not a derivation" and nominates it for this section. It is
+worse than undetermined: my own §2.1 reconciliation implies the opposite value.
 
-"It might not scale" is not a critique. "The purge job is untested above 5 million timeline
-entries per account, and a load test at 5 billion entries would show whether the 24 hour target
-holds" is.
+```
+wide accounts                   20,000,000 x 0.1%          =         20,000
+their follower edges            20,000 x 1,000,000 (min)   = 20,000,000,000 (registered)
+active fraction (§1.3)          20,000,000 / 500,000,000   =             4%
+active edges to wide accounts   20B x 4%                   =    800,000,000
+total active edges              20,000,000 x 50            =  1,000,000,000
+share                                                      =            80%
+wide followees per viewer       50 x 80%                   =             40
+```
+
+40, not 0–3. That is 13x the top of the assumed range and 4x past the ~10 at which §7.5 says the
+merge doubles read latency. For 0–3 to hold, followers of the largest accounts must be active at
+0.3% against a population rate of 4% — a **13x activity skew against exactly the accounts that
+attract sign-ups**. That skew is not implausible (sign up, follow five celebrities, lapse) and is
+probably why the §2.1 reading works at all, but I never argued it and never bounded it.
+
+40 is also the *favourable* number. §2.1 names a second reading of "top 0.1% of accounts" — 0.1%
+of 500M registered rather than of 20M active — under which the figure is **1,000 wide followees
+per viewer**. I design against 20,000 wide accounts and therefore against 40, but no reading of
+the constraint table produces a number anywhere near 0–3.
+
+**Worse, the pull path's reads are never charged against anything.** §3.4 step 2 issues one range
+read per wide followee against `posts_by_author`, which §8.4 places in the post store — the same
+store §7.3 sizes at ~25,000 reads/s. §7 never counts them:
+
+```
+peak timeline requests (§7.0)                17,361 req/s
+x 2 wide followees (the §12 trace)       =   34,722 range reads/s  = 1.4x the 25,000/s budget
+x 3 wide followees (§3.4's upper bound)  =   52,083 /s             = 2.1x
+x 40 (the §2.1-implied figure)           =  694,440 /s             = 27.8x
+plus hydration misses at 95% (§7.3)      =   17,361 /s
+```
+
+The read path is over budget at its own stated design point, before any §7 bottleneck fires. And
+§7.2's mitigation for bottleneck #1 — dial the threshold down to 25,000 — moves load into this
+exact path. The dial has no safe direction, which §7.5 half-admits and then does not price.
+
+**Why I accepted it.** The prompt gives a mean and a tail and no distribution, and §2.1 spends its
+budget proving the two cannot describe one population. Having adopted a reading to make §2 work, I
+carried the prompt's raw follower counts into §7, §11 and §12 instead of carrying the reading.
+That is the actual error: not the assumption, but applying it in one section and not the rest.
+
+**The test that would expose it.** A measurement first, then a load test.
+
+1. Sample 10,000 active accounts' follow graphs. Metric: `wide_followees_per_viewer`, mean and
+   p95, counting followees at or above the live threshold. **Declare failed at a mean above
+   1.44** — that is 25,000 ÷ 17,361, the point at which the pull path alone consumes the post
+   store's entire stated read capacity. The secondary threshold is §7.5's own: **mean above 10**
+   and the merge doubles read latency.
+2. Replay home-timeline reads at the §7.0 peak of **17,361 req/s** against the measured
+   distribution rather than the assumed one. Metric: p99 `GET /v1/timeline/home`, with the trace
+   attributed between merge and hydration. **Declare failed at 400 ms (§10.2)** with merge
+   dominating — which is §11.1's own "what would change my mind" condition, fired on day one.
+
+### 13.2 The post store's read budget is invented at both ends
+
+**What is weak.** Bottleneck #2 (§7.1 row 2) is the ratio of two numbers I asserted and never
+derived: a 95% cache hit rate on the demand side, and ~25,000 reads/s of capacity on the supply
+side. Neither has a source.
+
+The demand side is a lever, because the load is the *miss* rate, not the hit rate:
+
+```
+hit 95%  ->  17,361 reads/s  =  0.7x budget   (the assumed case)
+hit 92%  ->  27,778 reads/s  =  1.1x          (already over; this is §7.3's own alert threshold)
+hit 90%  ->  34,722 reads/s  =  1.4x
+hit 85%  ->  52,083 reads/s  =  2.1x
+hit  0%  -> 347,222 reads/s  = 13.9x          (a cold shard)
+```
+
+Three points of drift — less than the gap between a weekday and an incident — puts the store over
+budget. §7.3 names three things that move it (deep pagination, a cold shard, edit invalidations)
+and none is traffic growth.
+
+The supply side is worse, because it appears exactly twice (§7.3, §8.4) with no working behind it
+and load-bears in three places: bottleneck #2's 1.4x headroom, the 92% alert, and §8.4's
+"34,722 against 25,000" line — which is the entire stated justification for buying a replica per
+timeline shard, 384 GB of RAM. Sanity-checking it against my own storage sizing suggests it is
+too low, which would be a different kind of wrong:
+
+```
+§4.3 storage    1.62 TB/month at RF 3 -> 19.4 TB at 12 months
+a cluster that holds 19.4 TB is not a cluster that serves only 25,000 reads/s
+25,000 reads/s implies roughly 2-3 nodes, which cannot hold 19.4 TB
+```
+
+I am not going to substitute another unsourced figure for the first one. The point is that the
+ranking in §7.1 and the spending decision in §8.4 both rest on a number with no derivation, and it
+could be wrong in either direction.
+
+**Why I accepted it.** Sizing a cache needs a workload and there is no workload before there is a
+system; 95% is the right order of magnitude for a reverse-chronological feed. The capacity figure
+has less excuse — I used it as a fixed budget to rank bottlenecks against, which made the ranking
+look quantitative when its denominator was a guess.
+
+**The test that would expose it.** Two, in order.
+
+1. **Derive the capacity.** On a cluster sized to hold 12 months at RF 3, measure p99 point-read
+   latency against QPS. Metric: sustained reads/s at p99 < 10 ms. **If the measured figure differs
+   from 25,000 by more than ±50%, §7.1 rows 2 and 4 and all of §8.4 are invalid and must be
+   re-ranked** — including whether the replica per timeline shard is worth buying.
+2. **Test the cliff.** Flush one of the 8 cache shards during the peak hour at **17,361 req/s**,
+   with warm-fill and the shared concurrency limit both enabled (§7.3). Metrics: post-store read
+   rate, p99 timeline latency, `degraded: true` response fraction. **Declare failed on any of:
+   post-store reads above the measured capacity for more than 60 s, p99 above 400 ms, or degraded
+   responses above the 0.1% error budget (§10.2).** Separately, measure the steady-state hit rate
+   for a week: **below 92% and the store is undersized as designed.**
+
+### 13.3 Bottleneck #2 exists because of a behavioural parameter I guessed, and it has 1.4x headroom
+
+**What is weak.** Every read figure in this document descends from one number: **25 timeline
+requests per active user per day** (§7.0). It produces the 12.4:1 ratio, the 17,361 req/s peak and
+the 347,222 hydrations/s that make bottleneck #2 exist at all. I chose it, and the cross-check the
+prompt asks for is circular — deriving 500M requests/day from 25/day and then reading 25/day back
+out of it is not a cross-check.
+
+The non-circular cross-check I should have run does not obviously pass:
+
+```
+post slots consumed   25 requests x 20 posts per page   = 500/day
+posts actually arriving  50 followees x 2.5 posts/day   = 125/day
+re-read factor                                          =   4x
+```
+
+Every post in a viewer's timeline is fetched four times a day. That may be right — refresh-heavy
+feed behaviour looks exactly like this — but it is the sole driver of the hydration rate and I
+never named it, so the 95% cache hit rate of §13.2 is not an independent assumption: it is the
+same guess wearing a different hat.
+
+Sensitivity, at a 95% hit rate throughout:
+
+```
+10 sessions/day -> 138,889 hydrations/s peak ->  6,944 misses/s  = 0.28x   bottleneck #2 disappears
+25 sessions/day -> 347,222/s                 -> 17,361/s         = 0.69x   the design's case
+36 sessions/day -> 500,000/s                 -> 25,000/s         = 1.00x   the ceiling
+50 sessions/day -> 694,444/s                 -> 34,722/s         = 1.39x   over
+```
+
+**1.4x headroom against a parameter nobody has measured**, and the failure is invisible from the
+write side. Nor do the rate limits defend it: §5.5 allows 120 timeline requests per minute, which
+is 2/s, **6,912x the modelled 25/day**. Only **8,680 users** — 0.043% of actives — sitting at
+their limit reproduce the entire designed peak. The rate limits bound abuse per account; they do
+not bound the capacity plan, which is the §9.3 observation ("per-user limits are 960x short of
+protecting the fleet") applied to reads instead of writes.
+
+**Why I accepted it.** The prompt deliberately withholds the read-to-write ratio and asks for one
+to be stated and defended. 25/day is a defensible guess for an engaged microblog user. What I
+should not have done is treat it as settled once stated and then build three sections of
+bottleneck ranking on top of it without a sensitivity band.
+
+**The test that would expose it.** This one needs no load test — it needs a week of production
+telemetry, and until then the capacity model is unvalidated.
+
+- Metric: `timeline_requests_per_active_user_per_day`, mean and p95, from the §10.3 gateway
+  histogram. **Declare the design failed above 36/day**, where post-store misses reach 25,000/s
+  even at the assumed 95% hit rate. Below 10/day, bottleneck #2 does not exist and §7.1's ranking
+  is wrong in the other direction.
+- Second metric, same week: `posts_hydrated_per_unique_post_per_day` — the re-read factor measured
+  rather than inferred. **Above 6 and the cache window in §4.4 is sized for the wrong workload**,
+  because the re-reads are spread wider than the 48-hour hot set assumes.
+- Load test to pair with it: replay the peak at **50 sessions/day** (694,444 hydrations/s) and
+  confirm the concurrency limit sheds to `degraded: true` rather than taking the post store down.
+  **Failure is any 5xx on the timeline endpoint** — degradation is the designed answer (§5.1), and
+  if it does not hold at 1.4x, the graceful path is decorative.
 
 ---
 
