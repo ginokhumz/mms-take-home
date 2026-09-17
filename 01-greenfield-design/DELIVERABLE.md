@@ -2199,24 +2199,352 @@ claiming something it has not done.
 
 ## 12. Worked trace
 
-**This section is heavily weighted.** Walk this exact scenario end to end.
-
 > An account with 3 million followers edits a post 10 minutes after publishing it, while one of
 > its followers is part way through paginating their home timeline.
 
-Requirements:
+### 12.0 Cast, identifiers, and starting state
 
-- Invent identifiers and keep them consistent throughout: user identifiers, post identifiers,
-  cursor values, revision numbers.
-- Number the steps.
-- After each step, state the resulting state at each component you named in section 4.
-- Show the actual request and response payloads at each API call, matching section 5.
-- State what the paginating follower sees, and whether they can see the post twice, zero times,
-  or in two different versions.
-- Name every point at which the system is inconsistent, and for how long.
+| Thing | Value | Why it is what it is |
+|---|---|---|
+| Author | `grace`, `author_id = 88213004`, **3,000,000 followers** | 3,000,000 ≥ the 100,000 wide threshold (§3.3), so grace is a **wide** author: her posts are **never fanned out**, only pulled at read time |
+| Reader | `rob`, `user_id = 41777219`, follows 62 accounts | 60 narrow (push set) + 2 wide: `grace` (88213004) and `newsdesk` (90112233). 2 wide followees is inside the 0–3 the read path is sized for (§3.4 step 2, §7.1 row 4) |
+| The post | `post_id = 1827639201234567890`, published `2026-09-17T10:00:00.000Z` | |
+| The edit | at `2026-09-17T10:10:00.000Z`, 10 min in, window closes `10:15:00.000Z` | |
 
-The trace must agree with your diagram, your data model and your API contract. A disagreement
-between them is the single most common reason this section loses marks.
+The post ID is a real Snowflake under the §3.3 layout, and every other ID in this trace is minted
+the same way, which is what makes the cursor comparisons below arithmetic rather than assertion:
+
+```
+1827639201234567890 >> 22            = 435,743,141,468  ms since the service epoch (2012-11-26T02:14:18.532Z)
+(1827639201234567890 >> 12) & 0x3FF  = 676              shard
+1827639201234567890 & 0xFFF          = 722              sequence
+epoch + 435,743,141,468 ms           = 2026-09-17T10:00:00.000Z   ✔ matches created_at
+1 ms of wall clock                   = 2^22 = 4,194,304 ID units   -> later post => strictly larger ID
+```
+
+The four IDs that matter, all derived that way:
+
+| Label | Timestamp | post_id | Cursor (`base64url({"v":1,"b":"<id>"})`, §5.3) |
+|---|---|---|---|
+| **P** — grace's post | 10:00:00.000Z | `1827639201234567890` | — (head of page 1) |
+| Oldest item on page 1 | 09:41:06.000Z | `1827634444891111431` | `eyJ2IjoxLCJiIjoiMTgyNzYzNDQ0NDg5MTExMTQzMSJ9` |
+| Oldest item on page 2 | 09:12:33.000Z | `1827627260048323001` | `eyJ2IjoxLCJiIjoiMTgyNzYyNzI2MDA0ODMyMzAwMSJ9` |
+| Oldest item on page 3 | 08:35:52.000Z | `1827618028385243256` | `eyJ2IjoxLCJiIjoiMTgyNzYxODAyODM4NTI0MzI1NiJ9` |
+
+---
+
+### Step 1 — 10:00:00.000Z grace publishes P
+
+```http
+POST /v1/posts
+Authorization: Bearer <grace access token, sub=88213004>
+Idempotency-Key: 5f2b8c1e-0a3d-4e77-9b21-6c0d1a7e4f9b
+Content-Type: application/json
+
+{ "text": "the ferry timetable changed again", "media_id": null, "alt": null }
+```
+
+```http
+HTTP/1.1 201 Created
+Location: /v1/posts/1827639201234567890
+ETag: "1"
+X-Request-Id: 01J9X2K3M4N5P6Q7R8S9T0
+```
+```json
+{
+  "id": "1827639201234567890",
+  "author": { "id": "88213004", "handle": "grace", "display_name": "Grace",
+              "avatar_url": "https://cdn.chirp.example/a/88213004/64.webp" },
+  "text": "the ferry timetable changed again",
+  "image": null,
+  "created_at": "2026-09-17T10:00:00.000Z",
+  "revision": 1,
+  "edited_at": null,
+  "edit_count": 0,
+  "editable_until": "2026-09-17T10:15:00.000Z"
+}
+```
+
+`editable_until` is present because the caller **is** the author and the window is open (§5.0).
+
+**Component state after step 1** (§4 components; `—` means untouched):
+
+| Component | State |
+|---|---|
+| Post service (§4.2) | Validated 33 code points ≤ 500; minted `1827639201234567890`; returned 201 after the outbox row was durable, **before any fanout** (§3.3 step 4) |
+| Post store (§4.3) | `posts[1827639201234567890] = (author 88213004, text "the ferry…", revision 1, edit_count 0, edited_at null)`; `post_revisions[(1827639201234567890, 1)]` written in the same single-partition batch (§6.2); `idempotency_keys[(88213004, 5f2b8c1e…)] = completed, post_id 1827639201234567890` |
+| Author index (§4.9) | `posts_by_author[88213004]` gains `1827639201234567890` at the head |
+| Event log (§4.5) | `post.published` appended, partition key `author_id = 88213004` |
+| Post cache (§4.4) | — (written lazily on first hydration, not on publish) |
+| Fanout workers (§4.6) | Consume the event, look up grace's class, see **wide → skip**. **0 timeline writes.** |
+| Timeline store (§4.7) | **Unchanged. `tl:41777219` does not contain P and never will.** |
+| Search indexer / index (§4.11) | Indexing in flight; doc `_id = 1827639201234567890`, `revision: 1` visible after the 1 s refresh |
+
+The zero in the fanout row is the §11.1 decision paying for itself: the alternative writes
+3,000,000 entries here, which at the 400,000 entries/s cluster ceiling (§7.2) is **7.5 seconds of
+the entire timeline cluster for one post**.
+
+---
+
+### Step 2 — 10:07:13Z rob opens his timeline (page 1)
+
+```http
+GET /v1/timeline/home?limit=20
+Authorization: Bearer <rob access token, sub=41777219>
+```
+
+Timeline service (§4.8) does exactly §3.4: `LRANGE tl:41777219 0 19` for the push set (60 narrow
+followees) → `fg:41777219` says `grace` and `newsdesk` are wide → two bounded range reads
+`posts_by_author WHERE author_id = ? AND post_id < ∞ LIMIT 20` → k-way merge on ID descending →
+tombstone filter → one multi-get of 20 IDs against the post cache (P misses, falls through to the
+post store and is cached).
+
+```json
+{
+  "items": [
+    { "id": "1827639201234567890", "author": { "id": "88213004", "handle": "grace", "display_name": "Grace", "avatar_url": "https://cdn.chirp.example/a/88213004/64.webp" },
+      "text": "the ferry timetable changed again", "image": null,
+      "created_at": "2026-09-17T10:00:00.000Z",
+      "revision": 1, "edited_at": null, "edit_count": 0 },
+    "… 18 more posts, IDs strictly descending …",
+    { "id": "1827634444891111431", "author": { "id": "90112233", "handle": "newsdesk", "…": "…" },
+      "text": "…", "image": null, "created_at": "2026-09-17T09:41:06.000Z",
+      "revision": 1, "edited_at": null, "edit_count": 0 }
+  ],
+  "page": {
+    "next_cursor": "eyJ2IjoxLCJiIjoiMTgyNzYzNDQ0NDg5MTExMTQzMSJ9",
+    "has_more": true
+  },
+  "degraded": false
+}
+```
+
+No `editable_until` on any item — rob is not the author (§5.0).
+
+**Component state after step 2**
+
+| Component | State |
+|---|---|
+| Timeline store | Read-only; `tl:41777219` still holds the 60 narrow authors' entries only |
+| Author index | P served from `posts_by_author[88213004]` — **this is the only reason rob sees P at all** |
+| Post cache | `post:1827639201234567890` now populated with **revision 1**, TTL 48 h (§6.9) |
+| Post store | 1 point read on the hydration miss |
+| rob's client | DOM holds 20 posts, item 1 is P at revision 1, no "edited" chip. Client keeps `next_cursor = …MTQzMSJ9` and `newest_id = 1827639201234567890` (§5.3) |
+
+---
+
+### Step 3 — 10:08:41Z rob pages back (page 2)
+
+```http
+GET /v1/timeline/home?limit=20&cursor=eyJ2IjoxLCJiIjoiMTgyNzYzNDQ0NDg5MTExMTQzMSJ9
+```
+
+Decoded: `{"v":1,"b":"1827634444891111431"}`. Both halves of the hybrid take the same predicate —
+`LRANGE`-then-scan to that ID on the push set, `AND post_id < 1827634444891111431` on each author
+index range read.
+
+```json
+{
+  "items": [ "… 20 posts, 1827634…431 > id ≥ 1827627260048323001 …" ],
+  "page": { "next_cursor": "eyJ2IjoxLCJiIjoiMTgyNzYyNzI2MDA0ODMyMzAwMSJ9", "has_more": true },
+  "degraded": false
+}
+```
+
+**State:** nothing mutates. rob's DOM is now 40 posts; P is still the revision-1 copy rendered at
+10:07:13Z, ~90 seconds stale in wall-clock terms and, at this instant, still correct.
+
+---
+
+### Step 4 — 10:10:00.000Z grace edits P (10 minutes in)
+
+```http
+PATCH /v1/posts/1827639201234567890
+Authorization: Bearer <grace access token, sub=88213004>
+If-Match: "1"
+Content-Type: application/json
+
+{ "text": "the ferry timetable changed again — 07:40, not 07:20" }
+```
+
+Post service checks, in order: `sub == author_id` (else 403 `not_author`); `now − created_at =
+600 s ≤ 900 s`, measured server-side against `posts.created_at` (else 409 `edit_window_closed`,
+terminal); `If-Match "1"` equals the stored revision (else 412 `revision_conflict`).
+
+```http
+HTTP/1.1 200 OK
+ETag: "2"
+X-Request-Id: 01J9X2K9ZZQ7B3V5M1D8HA
+```
+```json
+{
+  "id": "1827639201234567890",
+  "author": { "id": "88213004", "handle": "grace", "display_name": "Grace",
+              "avatar_url": "https://cdn.chirp.example/a/88213004/64.webp" },
+  "text": "the ferry timetable changed again — 07:40, not 07:20",
+  "image": null,
+  "created_at": "2026-09-17T10:00:00.000Z",
+  "revision": 2,
+  "edited_at": "2026-09-17T10:10:00.000Z",
+  "edit_count": 1,
+  "editable_until": "2026-09-17T10:15:00.000Z"
+}
+```
+
+**Component state after step 4**
+
+| Component | State |
+|---|---|
+| Post store | Single-partition logged batch (§6.2): `posts.text/revision=2/edit_count=1/edited_at` updated **and** `post_revisions[(…890, 2)]` appended. Revision 1 is never mutated |
+| Post cache | `DEL post:1827639201234567890` — **one key**. Issued before the 200 returns, which is what gives `GET /v1/posts/{id}` read-your-writes (§8.7) |
+| Event log | `post.edited` appended |
+| Fanout workers | **Not involved. Zero timeline writes. No timeline is read, let alone rewritten** (§11.2) |
+| Timeline store | **Unchanged — all 3,000,000 follower lists untouched.** They never held P in the first place (step 1), and even for a narrow author they would hold only `(post_id, author_id)`, 24 B, no body (§6.5) |
+| Author index | Unchanged — the edit does not change `post_id`, so P does not move in any ordering |
+| Search index | Reindex of `_id = 1827639201234567890` in flight; an overwrite, not a second doc (§6.7), so P can never appear twice in search results |
+| **`created_at`, and therefore the ID** | **Unchanged.** This is the property the whole answer below rests on |
+
+---
+
+### Step 5 — 10:10:07Z rob pages back again (page 3), 7 s after the edit
+
+```http
+GET /v1/timeline/home?limit=20&cursor=eyJ2IjoxLCJiIjoiMTgyNzYyNzI2MDA0ODMyMzAwMSJ9
+```
+
+```json
+{
+  "items": [ "… 20 posts, 1827627…001 > id ≥ 1827618028385243256 …" ],
+  "page": { "next_cursor": "eyJ2IjoxLCJiIjoiMTgyNzYxODAyODM4NTI0MzI1NiJ9", "has_more": true },
+  "degraded": false
+}
+```
+
+P's ID `1827639201234567890` is **11.9 billion ID units above** this page's upper bound
+(`1827639201234567890 − 1827627260048323001 = 11,941,186,244,889`, i.e. ~2,847 seconds of wall
+clock), so it cannot be selected by a `post_id <` predicate on either half of the merge. P does not
+appear on page 3. rob's DOM still shows the revision-1 text at position 1, now visibly stale.
+
+**State:** unchanged everywhere. The 20 hydrations for page 3 hit the post cache; none of them is P.
+
+---
+
+### Step 6 — 10:12:30Z rob pulls to refresh (fresh page 1)
+
+```http
+GET /v1/timeline/home?limit=20
+```
+
+Cursor omitted → the merge restarts at the head. P is still the newest item rob's followees have
+produced, so it is item 1 again, hydrated from the post cache — which **misses**, because step 4
+deleted the key — and is refilled from the post store at revision 2.
+
+```json
+{
+  "items": [
+    { "id": "1827639201234567890",
+      "author": { "id": "88213004", "handle": "grace", "display_name": "Grace", "avatar_url": "https://cdn.chirp.example/a/88213004/64.webp" },
+      "text": "the ferry timetable changed again — 07:40, not 07:20",
+      "image": null,
+      "created_at": "2026-09-17T10:00:00.000Z",
+      "revision": 2,
+      "edited_at": "2026-09-17T10:10:00.000Z",
+      "edit_count": 1 },
+    "… 19 more …"
+  ],
+  "page": { "next_cursor": "eyJ2IjoxLCJiIjoiMTgyNzYzNDQ0NDg5MTExMTQzMSJ9", "has_more": true },
+  "degraded": false
+}
+```
+
+`edit_count = 1 > 0` is the **edited indicator** (§5.0); the frontend renders "Edited" linking to
+the revision list. Note `next_cursor` is byte-identical to step 2's: P's position did not move,
+because edits do not change IDs (§1.3, §5.3).
+
+**State:** `post:1827639201234567890` repopulated at revision 2, TTL 48 h. If rob now pages forward
+from this cursor he gets exactly the page-2 items of step 3 — no duplicates, no gap.
+
+---
+
+### Step 7 — 10:12:44Z rob taps "Edited"
+
+```http
+GET /v1/posts/1827639201234567890/revisions
+```
+```json
+{
+  "post_id": "1827639201234567890",
+  "revisions": [
+    { "revision": 2, "text": "the ferry timetable changed again — 07:40, not 07:20", "created_at": "2026-09-17T10:10:00.000Z" },
+    { "revision": 1, "text": "the ferry timetable changed again", "created_at": "2026-09-17T10:00:00.000Z" }
+  ]
+}
+```
+
+One partition read, already newest-first, no pagination (§6.3). Strongly consistent: same partition
+as the post row, written in the same batch as step 4.
+
+---
+
+### 12.1 What the paginating follower sees — the direct answer
+
+**Once, in one version, and that version is revision 1.**
+
+- **Not twice.** P is a *wide*-author post, so it exists in exactly one place the merge can find it:
+  `posts_by_author[88213004]`. Even the general duplicate risk — an author reclassified narrow→wide
+  mid-flight, so P is both pushed and pulled — is removed by de-duplication on `post_id` at merge
+  (§4.8, §8.7). And pagination moves monotonically toward lower IDs while P's ID is fixed at the
+  head, so no later page can re-select it (§5.3).
+- **Not zero times.** P was returned on page 1 at 10:07:13Z. It is absent from pages 2 and 3 for the
+  ordinary reason — those pages are older than it — not because of the edit.
+- **Not in two versions *of P*.** rob's session only ever fetched P once. The revision-1 text sits in
+  his DOM from 10:07:13Z until he refreshes at 10:12:30Z, at which point it is replaced wholesale by
+  revision 2.
+
+The honest qualification: **rob's screen holds a mixed-vintage view between 10:10:00Z and
+10:12:30Z** — item 1 is P at revision 1 (read before the edit), pages 2 and 3 are as of 10:08:41Z
+and 10:10:07Z. Each page is a correct snapshot as of its own read time; the *session* is not a
+snapshot. That is the "no monotonic reads across a paginating session" row of §8.7, and it is the
+cost §11.2 accepted. There is one way rob sees two versions at once: if he opens P's permalink or
+finds it in search between 10:10:00Z and his refresh, that fetch hydrates revision 2 while the
+timeline card behind it still renders revision 1 — same post, two revisions, one screen, for as long
+as he leaves the stale card on screen.
+
+**Would the answer change if grace were narrow?** No. The push path stores `(post_id, author_id)`
+with no body (§6.5), so hydration is what decides the text either way. The only difference is *how*
+P got into rob's page (an `LPUSH` at publish versus a range read at request time) and the membership
+lag in row 1 of the table below.
+
+### 12.2 Every inconsistency window in this trace
+
+| # | Window | Opens → closes | Duration | Who sees what | Bounded by |
+|---|---|---|---|---|---|
+| 1 | Publish → in followers' timelines | — | **0 s here** | P is visible to all 3,000,000 followers the instant step 1 commits, because the pull path reads the author index live. A *narrow* author's post would lag p50 ~1 s / p99 30 s behind the fanout queue (§8.7) | Wide path has no fanout stage at all |
+| 2 | Publish → searchable | 10:00:00.000 → ~10:00:00.8 | **~820 ms** (`freshness_lag_ms` in the §5.1 endpoint-6 envelope); SLO ≤ 5 s p99 | A search for "ferry" misses P | Kafka + indexer + 1 s OpenSearch refresh (§11.3) |
+| 3 | Edit commit → post-cache DEL | inside step 4 | **~1 ms**, and *closed before* the 200 returns | Nobody: the write order is store-then-DEL-then-respond, which is what makes `GET /v1/posts/{id}` read-your-writes (§8.7) | Post service ordering |
+| 4 | In-flight hydrations racing the DEL | 10:10:00.000 ± request duration | **≤ one request in flight, p99 ~50 ms** | A timeline request whose multi-get was *issued* before the DEL and *returns* after it renders revision 1. Unavoidable: read and invalidate are not one operation | Request latency, not cache TTL |
+| 5 | Edit → reindexed in search | 10:10:00.0 → ~10:10:00.9 | **~900 ms**, same budget as #2 | A search matching the old terms "07:20" could still hit P. The *displayed* text is right regardless — search results are re-hydrated against the post cache before display (§4.11) — so the symptom is a spurious match, not wrong text | Indexer lag; SLO ≤ 5 s |
+| 6 | rob's rendered revision-1 card | 10:10:00 → 10:12:30 (his refresh) | **150 s here; unbounded in general** — it lasts as long as he does not refresh | rob reads the wrong ferry time. This is the real user-visible cost of the whole design and no server-side mechanism closes it | Client refresh only. A push channel would close it; out of scope (§1.2 — notifications) |
+| 7 | Cache repopulation after the DEL | 10:10:00 → first read of P | **one post-store read, ~5 ms** | Nothing, but it is worth sizing: of grace's 3,000,000 followers, assume 20% active = 600,000 × 25 timeline loads/day ÷ 86,400 = 174 req/s, ×3 peak = **521 req/s** that might place P on page 1; × 5 ms store latency = **2.6 concurrent misses**. A famous post's invalidation is not a stampede | §7.3 concurrency limit; single-flight coalescing would reduce 2.6 to 1 |
+| 8 | Cached author display name inside `post:…890` | n/a in this trace | up to **48 h** if grace renamed herself | Stale handle/display name on rendered cards (§6.9) | Cache TTL |
+
+Windows 3, 4 and 7 are all consequences of one cache key. Under the rejected §11.2 alternative
+(bodies copied into timeline entries), window 4 would instead be **7.5 s of rewrites across
+3,000,000 entries** (`3,000,000 ÷ 400,000 entries/s`, §7.2) racing the original fanout of the same
+post — and during it, different followers would hold *permanently* different revisions, with no read
+that repairs them.
+
+### 12.3 Two near-misses worth stating
+
+1. **The edit lands while page 1 is in flight (window 4).** rob's multi-get was issued at
+   09:59:59.98 and returns at 10:10:00.01. He gets revision 1 with `edit_count: 0`, and the API is
+   not lying — that was the state when the read was taken. `ETag: "1"` on that read is what would
+   make a subsequent conditional write from rob fail correctly if he were the author.
+2. **grace edits at 10:15:00.001Z instead.** `now − created_at = 900.001 s > 900 s` → `409` with
+   `{"error":{"code":"edit_window_closed","retryable":false,"details":{"editable_until":
+   "2026-09-17T10:15:00.000Z"}}}`. `retryable: false` is why the frontend must render this as a dead
+   end, not offer a retry button (§5.5). The check is server-side against `posts.created_at`; grace's
+   client clock is never consulted (§1.3).
 
 ---
 
