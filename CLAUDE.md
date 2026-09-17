@@ -20,6 +20,10 @@ to the contrary.
    one commit at the end" is listed as evidence of non-disclosure.
 4. **Commit in small steps, as you go.** A single squashed commit is a red flag. Commit dead ends
    too, with a message explaining the revert. Do not squash history on submission.
+   **Never run `git commit` unsolicited.** Finish the work, stage nothing, and ask — proposing the
+   commit message. The commits are the audit trail the debrief reads, so the wording and the
+   boundaries between commits are mine to approve. This applies even when a task obviously ends in
+   a commit.
 5. **The reasoning must be defensible without notes.** A mandatory 45-minute debrief follows:
    explain decisions and rejected alternatives from memory, reproduce a capacity calculation live,
    absorb live constraint changes, and walk through the frontend code. This is the practical limit
