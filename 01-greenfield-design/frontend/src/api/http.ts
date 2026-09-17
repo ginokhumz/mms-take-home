@@ -1,4 +1,5 @@
 import { ApiError, isAutoRetryable, parseApiError } from './errors';
+import type { UnavailableCode } from './errors';
 import { passthroughParams } from './mockControls';
 
 const BASE = '/v1';
@@ -13,6 +14,12 @@ const ACCESS_TOKEN = 'mock-access-token';
 const MAX_ATTEMPTS = 3;
 
 export interface RequestOptions {
+  /**
+   * The dependency this call depends on, used as the code when the request never reaches a server
+   * and there is no error body to read. Required rather than defaulted, so adding an endpoint
+   * cannot silently inherit another endpoint's dependency name.
+   */
+  unavailableCode: UnavailableCode;
   query?: URLSearchParams;
   body?: unknown;
   /** Required when publishing, and reused verbatim on every retry of that same post. */
@@ -33,7 +40,7 @@ export interface RequestOptions {
 export async function request<T>(
   method: 'GET' | 'POST' | 'PATCH',
   path: string,
-  opts: RequestOptions = {},
+  opts: RequestOptions,
 ): Promise<{ data: T; etag: string | null }> {
   const url = new URL(BASE + path, window.location.origin);
   for (const [k, v] of opts.query ?? []) url.searchParams.set(k, v);
@@ -56,10 +63,11 @@ export async function request<T>(
       });
     } catch {
       // A network failure produces no response, so there is no contract-shaped error body to
-      // parse. Synthesise one rather than letting a raw TypeError reach the UI.
+      // parse. Synthesise one rather than letting a raw TypeError reach the UI, and name the
+      // dependency this call actually needed: a failed publish must not report the timeline down.
       lastError = new ApiError({
         status: 503,
-        code: 'timeline_unavailable',
+        code: opts.unavailableCode,
         message: 'Cannot reach Chirp. Check your connection.',
         retryable: true,
         requestId: 'local-network-error',

@@ -1,4 +1,16 @@
 /**
+ * Every 503 in the contract names the dependency that is down, rather than saying "a service".
+ * That is why a call site has to say which one it is talking to: a request that dies on the wire
+ * produces no response body to read a code out of, and the client has to synthesise one. Naming
+ * the wrong dependency there would be a lie the user reads and an operator chases.
+ */
+export type UnavailableCode =
+  | 'post_service_unavailable'
+  | 'timeline_unavailable'
+  | 'search_unavailable'
+  | 'follow_service_unavailable';
+
+/**
  * Every non-2xx response carries { error: { code, message, retryable, request_id, details? } } and
  * nothing else ever appears in an error position. The frontend switches on `code`, never on
  * `message`, and shows a retry affordance if and only if `retryable` is true.

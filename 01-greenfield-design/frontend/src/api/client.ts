@@ -21,14 +21,20 @@ export async function getHomeTimeline(
 ): Promise<TimelinePage> {
   const query = new URLSearchParams({ limit: String(opts.limit ?? 20) });
   if (opts.cursor != null) query.set('cursor', opts.cursor);
-  const { data } = await request<TimelinePage>('GET', '/timeline/home', { query });
+  const { data } = await request<TimelinePage>('GET', '/timeline/home', {
+    query,
+    unavailableCode: 'timeline_unavailable',
+  });
 
   // The contract states next_cursor is null exactly when has_more is false. Asserted rather than
   // assumed: a server that broke this invariant would make the store loop forever or stall with a
   // "load more" button that can never do anything, both of which are silent failures.
   if (data.page.has_more === (data.page.next_cursor === null)) {
     throw new ApiError({
-      status: 502,
+      // 500 internal_error is the contract's unclassified retryable row, and the client stays
+      // inside the contract's own status table rather than inventing a code the document has
+      // no entry for. The condition is a server bug however it is labelled.
+      status: 500,
       code: 'internal_error',
       message: 'The timeline could not be loaded.',
       retryable: true,
@@ -43,7 +49,11 @@ export async function getHomeTimeline(
  * and passes the same one back on every retry of that post.
  */
 export async function publishPost(body: PublishRequest, idempotencyKey: string): Promise<Post> {
-  const { data } = await request<Post>('POST', '/posts', { body, idempotencyKey });
+  const { data } = await request<Post>('POST', '/posts', {
+    body,
+    idempotencyKey,
+    unavailableCode: 'post_service_unavailable',
+  });
   return data;
 }
 
@@ -57,12 +67,18 @@ export async function editPost(
   body: EditRequest,
   ifMatchRevision: number,
 ): Promise<Post> {
-  const { data } = await request<Post>('PATCH', `/posts/${id}`, { body, ifMatchRevision });
+  const { data } = await request<Post>('PATCH', `/posts/${id}`, {
+    body,
+    ifMatchRevision,
+    unavailableCode: 'post_service_unavailable',
+  });
   return data;
 }
 
 /** Revision history: public, newest first, not paginated. */
 export async function getRevisions(id: PostId): Promise<RevisionsResponse> {
-  const { data } = await request<RevisionsResponse>('GET', `/posts/${id}/revisions`);
+  const { data } = await request<RevisionsResponse>('GET', `/posts/${id}/revisions`, {
+    unavailableCode: 'post_service_unavailable',
+  });
   return data;
 }
