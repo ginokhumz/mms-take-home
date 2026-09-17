@@ -53,6 +53,7 @@ Priority is set by how often each thing happens and how badly users notice when 
 | Unfollow | Stops future posts arriving immediately; existing timeline entries are hidden when read, not rewritten | §11.1 |
 | Deletion scope | Posts, images, edit history, timeline entries, search docs, follow edges. Aggregate logs and metrics are anonymised, not purged | §9, §11.4 |
 | Deleted account during 24 h window | Account is blocked from login and the profile is hidden immediately; the 24 h budget covers only copies in timelines, caches and search | §11.4 |
+| Author's own posts | Fanout includes a self-edge, so an author's own post appears in their own home timeline on the same ~1 s path as a follower's | §8.7, §01b |
 | Timeline depth | Materialised timelines keep only the newest ~800 entries per user; older pages are rebuilt on demand | §2, §6 |
 | Single region | Designed for one region with multi-AZ; multi-region noted in §14 | §3, §8 |
 
@@ -320,8 +321,10 @@ deep pagination falls back to the author-index path (§4.8).
 one shard, so a page is one round trip.
 **Unavailable (node lost).** The users on that shard lose their push set. The timeline service
 detects the empty/errored read and serves a **degraded timeline from the pull path plus the author
-index for followed accounts**, marked stale in the response. Lost lists are rebuilt lazily from the
-author indexes rather than by replaying Kafka.
+index for followed accounts**, marked stale in the response. Each shard therefore runs a replica for
+fast promotion; lazy rebuild from the author indexes is the second line of defence, not the first,
+because an unthrottled rebuild storm exceeds the post store's whole read budget (the arithmetic is
+in §8.4). Kafka is never replayed for this.
 
 ### 4.8 Timeline service
 
@@ -1386,13 +1389,230 @@ a background job. None of these three has a cliff; they have a bill.
 
 ## 8. Failure modes and reliability
 
-For each significant failure, state the effect a user sees and the recovery.
+### 8.0 The two properties everything else is built to protect
 
-Cover at least: a fanout worker dies mid post, the search indexer falls behind, the image store
-is unavailable on publish, a timeline cache node is lost, the primary datastore fails over, a
-purge job fails halfway.
+1. **A post that returned 201 is never lost.** The post row and the outbox row are written in one
+   partition write (§3.3 step 3), so there is no window in which the API has acknowledged a post
+   that the log will not eventually carry. Every downstream consumer — fanout, indexer, purge — is
+   a replayable function of that log, with 7 days of retention (§4.5). Recovery for most of this
+   section is therefore "restart the consumer and let it drain", and the interesting question is
+   *how long the drain takes*, which is what I compute below.
+2. **Nothing on the read path is allowed to fail the whole page.** Every dependency of
+   `GET /v1/timeline/home` has a defined degraded answer: a partial page with `degraded: true`
+   (§5.1 endpoint 2), a gap where one post would be, or a stale-but-ordered list. A 503 for the
+   timeline is reserved for the timeline service itself being gone.
 
-State your consistency model, per read path. Say where you accept staleness and for how long.
+**Blast radius, by dependency.** Read this as "what a user can still do".
+
+| Dependency down | Publish | Home timeline | Single post | Search | Follow |
+|---|---|---|---|---|---|
+| Fanout workers (§4.6) | works | stale (no new narrow-author posts); wide authors still appear | works | works | works |
+| Event log (§4.5) | works (outbox buffers) | stale | works | stale | works |
+| Timeline store (§4.7) | works | `degraded: true`, pull path only | works | works | works |
+| Post cache (§4.4) | works | slow, then shed (§7.3) | slow | slow | works |
+| Post store (§4.3) | **fails 503** | cached posts only, gaps elsewhere | 503 on miss | works (index has its own copy) | works |
+| Object store / CDN (§4.12) | text-only works, image publish fails | text renders, broken-image placeholder | same | works | works |
+| Search index (§4.11) | works | works | works | **503** | works |
+| Follow graph (§4.10) | works | last cached `wide_followees`, push set unaffected | works | works | **503** |
+
+Only two rows take the product down in any real sense, and they are the two stores that hold
+something nothing else holds.
+
+### 8.1 A fanout worker dies mid-post
+
+**What happens.** A worker is part-way through a 90,000-follower narrow author, chunked into nine
+10,000-follower pages (§4.6). It has committed pages 1–4 and dies before committing its offset.
+
+**What the user sees.** 40,000 followers already have the post. The other 50,000 do not, for as long
+as the partition is unassigned — Kafka rebalance, a few seconds. Then a new worker resumes from the
+last committed offset, which is *before* page 1, and re-pushes all nine pages.
+
+**Why the duplicate work is safe.** Redelivery `LPUSH`es post IDs that are already in those 40,000
+lists, so those lists now contain the same `post_id` twice. The merge in §4.8 de-duplicates by post
+ID before hydration, so the reader never sees the post twice. The cost is one wasted entry out of
+800 per affected list — a 0.125% shortening of timeline depth for those users, reclaimed as the list
+trims naturally. I accept that rather than paying a per-entry existence check on every one of
+~87,000 writes/s at peak.
+
+**Recovery time for a real backlog.** A five-minute total fanout outage at peak:
+
+```
+backlog        86,806 entries/s x 300 s          = 26,041,800 entries
+drain surplus  400,000 capacity - 86,806 live    =    313,194 entries/s
+drain time     26,041,800 / 313,194              =         83 s
+```
+
+So a 5-minute outage costs ~6.4 minutes of staleness, not 5 minutes of permanent loss. That ratio
+only holds while the cluster has headroom; at the 1.4x headroom of §7.2 the same outage drains in
+`26,041,800 / (400,000 - 294,963) ≈ 248 s`, three times slower. **Headroom is recovery speed** —
+that is the second argument for the 16-shard split in §7.2, independent of steady-state capacity.
+
+**Detection.** Consumer lag per partition, paged at p99 fanout lag > 30 s (§10). Nothing else
+alerts: publish still returns 201 in milliseconds (§3.3 step 4).
+
+### 8.2 The search indexer falls behind
+
+**What the user sees.** A post published now is not findable. There is no error and no wrong result
+— search returns a correct answer to an older corpus, and `GET /v1/search` reports
+`freshness_lag_ms` (§5.1 endpoint 6) so the client can say "results may be up to N seconds old"
+rather than silently lying.
+
+**Budget and recovery.** The 5 s requirement has ~3 s of slack against a ~2 s steady-state path
+(§7.4). A ten-minute indexer stall:
+
+```
+backlog       1,736 docs/s x 600 s        = 1,041,600 docs
+drain surplus 3,500 - 1,736               =     1,764 docs/s
+drain time    1,041,600 / 1,764           =       590 s  (~10 min)
+```
+
+Roughly 1:1 — a ten-minute stall is a twenty-minute freshness incident. Recovery is automatic
+(replay from the log) and requires no reindex, because indexing is idempotent on `post_id` +
+`revision`: a replayed document overwrites itself.
+
+**Why edits do not make this worse.** Edits are a separate consumer group (§7.4). An edit storm
+re-indexing existing documents cannot delay first-time visibility of new posts, which is the
+promise with the 5 s number attached to it.
+
+**Total index loss.** The index is a derived store, so the recovery path exists — replay
+`post.published` from the archive — but the log holds 7 days and the corpus is 1.5 B docs/month
+(§4.11). Rebuilding from the post store is a days-long bulk job. I would restore from a snapshot and
+replay only the tail; the honest version is that full search rebuild is a multi-hour to multi-day
+degradation, and I have not designed it (§13).
+
+### 8.3 The image store is unavailable on publish
+
+**Which step fails matters.**
+
+- **At presign** — `POST /v1/media` returns `503`. No post exists, so there is nothing to clean up.
+  At 15% image rate, `1,736 x 0.15 ≈ 260 posts/s` at peak are blocked and the other ~1,476/s
+  publish normally. The client's correct behaviour is to offer "post without the image", which keeps
+  85% of the write path alive during a total object-store outage.
+- **After upload, before finalise** — the media row is stuck in `uploaded` (§6.10), so
+  `POST /v1/posts` returns `409 media_not_ready`, which is non-retryable per §5.5. The client
+  re-uploads. Orphaned objects with no referencing post are collected after 24 h (§6.10).
+- **On delivery** — posts render with a broken-image placeholder; text reads normally. This is the
+  cheapest failure in the system precisely because images never pass through a service I operate
+  (§3.3 step 1).
+
+**The ordering rule that makes this simple:** media is durable *before* the post that references it
+exists. There is never a post pointing at an object that was never written — the failure is always
+"no post", never "post with a dead image".
+
+### 8.4 A timeline cache node is lost
+
+**What the user sees.** The timeline store is 8 shards (§7.2), so one lost shard is
+`20,000,000 / 8 = 2,500,000` users whose push set is empty. Their next read gets a page assembled
+from the pull path alone, with `degraded: true`: posts from wide accounts they follow, and nothing
+from narrow accounts. For a typical viewer with 0–3 wide followees that is a **nearly empty
+timeline**, which is why the flag exists — the frontend must distinguish "you follow nobody" from
+"we are missing data", and without the flag both are the same empty `LRANGE` (§6.5).
+
+**Why lazy rebuild is not enough on its own.** Rebuilding a user's list means range-reading the
+author index for their followees (§4.9), which lives in the post store:
+
+```
+2,500,000 users rebuilt within 1 h = 694 users/s x 50 followees = 34,722 reads/s
+post store sized for                                            ≈ 25,000 reads/s
+```
+
+The rebuild storm is 1.4x the post store's entire read capacity — **the recovery mechanism is
+bigger than the thing it is recovering**, and it lands on the store that is already bottleneck #2
+(§7.3). Spreading it over six hours gets to 5,787 reads/s, which fits, but six hours of degraded
+timelines for 2.5 M users is not acceptable either.
+
+**So the timeline cluster runs one replica per shard.** Cost: a second 384 GB, i.e. 768 GB of RAM
+total. Failover promotes the replica in seconds and the push set survives; lazy rebuild is kept as
+the second line of defence for a genuine double failure, and it runs under a global concurrency cap
+so it can never exceed the post store's budget. This is the one place I buy redundancy outright
+rather than derive it, and the 34,722-vs-25,000 line above is the reason.
+
+**Data loss on failover is acceptable here.** The timeline store is a derived cache; a promoted
+replica missing the last few seconds of `LPUSH`es loses a handful of entries, and those posts are
+still reachable through the author index and the post's own page. I do not enable AOF fsync for it.
+
+### 8.5 The primary datastore fails over
+
+The post store is a quorum-replicated wide-column cluster (§4.3), not a single primary, so "failover"
+has two distinct meanings.
+
+**A replica or a whole AZ is lost.** RF 3 across 3 AZs, writes and reads at `LOCAL_QUORUM` (2 of 3).
+Losing one AZ leaves 2 of 3 replicas — quorum is still achievable, publish keeps working, and the
+returning nodes catch up by hinted handoff and repair. No user-visible effect beyond latency, which
+is the reason for choosing a leaderless store for the one thing that must accept writes.
+
+**A second replica is lost.** Quorum is unreachable for the affected token ranges. Publish returns
+`503 post_service_unavailable` (§5.5, retryable, with the same `Idempotency-Key`, so a client retry
+after recovery produces exactly one post — §5.4). Reads for those ranges fail on cache miss; the
+timeline renders the posts it could hydrate and marks the page `degraded: true` (§7.3 point 2)
+rather than 503-ing the page. Search still works, because the index holds its own copy of the body.
+
+**The stateful things that *do* have a primary** — the Redis clusters (§4.4, §4.7) and their
+failovers — are covered above: both are derived, both tolerate losing seconds of writes, and neither
+can lose data that is not reconstructible from the post store or the log.
+
+**What this costs on the write path.** `LOCAL_QUORUM` means every publish waits for 2 of 3 replicas.
+That is the durability price for property (1) in §8.0, and it is paid on 1,736 writes/s at peak,
+which is small enough that I do not trade it for `ONE`.
+
+### 8.6 A purge job fails halfway
+
+**The user-visible promise is already kept before the job starts.** Deletion writes the author to
+the tombstone set synchronously (§4.13); the timeline filter (§3.4 step 4) and search drop that
+author's posts from that moment. So a purge that dies halfway is an *unfinished cleanup*, not a
+visible resurrection: the 24 h requirement is about copies, and copies are already unreachable.
+
+**Resumability.** A 3 M-follower account is `3,000,000 / 10,000 = 300` follower buckets (§6.6). The
+job checkpoints per bucket, and every operation is delete-if-present, so re-running a bucket is a
+no-op. A crash costs at most one bucket of re-work — 10,000 deletes, well under a second against a
+budget of `3,000,000 / 86,400 ≈ 35 deletes/s` (§7.5).
+
+**The failure that actually matters is a purge that never completes**, because the tombstone entry
+cannot be retired until it does (§6.9). A stuck purge is therefore a slow leak in a set that is
+supposed to hold ~2,000 entries (16 KB) and is replicated to every timeline service instance. The
+guard is an SLO on purge completion — alert at 18 h against the 24 h budget, six hours of margin to
+intervene — plus a hard rule that the tombstone entry is removed only on verified completion, never
+on a timer. **Leaking a tombstone is cheap; retiring one early un-deletes a user's posts.**
+
+**Partial-purge auditability.** Each purge writes a per-store completion record (`posts`,
+`revisions`, `timelines`, `search`, `media`, `follow edges`). That record is the evidence for a
+"has this user's data actually been removed" question, which is the one question a deletion feature
+gets asked under audit.
+
+### 8.7 Consistency model, per read path
+
+The system is **strongly consistent for everything that answers "what is this post?", and
+eventually consistent for everything that answers "which posts are there?"**. That split is
+deliberate: the first question has one answer in one place (§6's rule — the body is stored once),
+the second is assembled from derived stores that are allowed to lag.
+
+| Read path | Model | Staleness accepted | Bounded by |
+|---|---|---|---|
+| `GET /v1/posts/{id}` | Read-your-writes | ~0 | `PATCH` returns only after the post-store write is durable **and** the cache key is deleted, so any later read is ≥ the new revision |
+| `GET /v1/posts/{id}/revisions` | Strong | 0 | Same partition as the post (§6.3) |
+| `POST /v1/posts` → author's own timeline | Eventual | p50 ~1 s, p99 30 s | Fanout lag; the frontend's optimistic insert covers the gap (§01b) |
+| `GET /v1/timeline/home` — membership | Eventual | p50 ~1 s, p99 30 s, alert at 30 s | Fanout lag (§8.1). Wide-author posts are *not* subject to this: the pull path reads the author index live |
+| `GET /v1/timeline/home` — content of an item | Read-time current | ≤ 1 cache round trip | Hydration always fetches the current revision; no timeline stores a body (§11.2) |
+| Across pages of one paginating session | **No monotonic-read guarantee** | Unbounded within the session | Page 1 may show revision 1 and page 3 revision 2 of different posts; each page is correct as of its own read time (§12) |
+| `GET /v1/search` | Eventual, with an SLO | **≤ 5 s p99**, reported per response as `freshness_lag_ms` | Indexer lag (§7.4) |
+| Deleted account's posts | Effectively immediate | ≤ tombstone replication, ~1 s | Tombstone filter, not the purge (§8.6) |
+| Unfollowed author's posts | Immediate on read, entries not rewritten | ~0 for hiding; ≤ 60 s for "stops arriving" | `fg:{user_id}` TTL (§6.9) |
+| Wide/narrow reclassification | Eventual | ≤ 60 s, during which a post may be both pushed and pulled | De-duplicated by `post_id` at merge (§4.8, §6.6) |
+| Author display name / handle in a rendered post | Eventual | **up to 48 h** | `post:{post_id}` embeds it for one-multi-get hydration (§6.9) |
+
+**Where I knowingly give something up.** Two entries above are worse than a user would guess:
+
+- **No monotonic reads across a paginating session.** Fixing it would mean pinning a read timestamp
+  per cursor and hydrating "as of" that time — which means keeping old revisions readable per
+  session and defeats the entire point of hydrate-at-read-time. The visible symptom is a reader
+  seeing two versions of *different* posts in one scroll. Named and traced in §12.
+- **48 h staleness on an author's display name.** The alternative is a second multi-get against a
+  user store on every hydration — 347,222 extra reads/s at peak (§7.0) to make a rename propagate
+  faster. I chose the cache embed. A handle change is rare; 347k reads/s is not.
+
+**What I am not defending against.** Region loss. §1.3 assumes a single region with multi-AZ, so an
+entire-region outage is total unavailability with an RPO bounded by cross-region backups of the post
+store, and I have not designed the failover (§14).
 
 ---
 
