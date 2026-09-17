@@ -1,8 +1,8 @@
 import type { Plugin } from 'vite';
-import type { ServerResponse } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Post, TimelinePage } from '../src/api/types';
-import { posts } from './corpus';
-import { encodeCursor, decodeCursor } from './snowflake';
+import { posts, revisions, VIEWER } from './corpus';
+import { encodeCursor, decodeCursor, snowflake } from './snowflake';
 import { faultResponse, maybeFault } from './faults';
 
 /**
@@ -87,6 +87,83 @@ function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function readBody(req: IncomingMessage): Promise<unknown> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => chunks.push(c));
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+      } catch {
+        resolve(null);
+      }
+    });
+  });
+}
+
+/**
+ * Length is counted in Unicode code points after NFC normalisation, which is the rule the contract
+ * states. A family emoji costs 1, and a decomposed é costs 1 rather than 2, so the client's live
+ * counter and this check agree about what "501 characters" means.
+ */
+function textOrNull(body: unknown): string | null {
+  if (typeof body !== 'object' || body === null) return null;
+  const text = (body as Record<string, unknown>)['text'];
+  if (typeof text !== 'string') return null;
+  const length = [...text.normalize('NFC')].length;
+  if (length < 1 || length > 500) return null;
+  return text.normalize('NFC');
+}
+
+/**
+ * Completed publishes, keyed by Idempotency-Key. A repeat of a key that already finished returns
+ * the original post rather than creating a second one, which is what makes the client's automatic
+ * retry of a publish safe.
+ */
+const publishedByKey = new Map<string, Post>();
+
+/** POST /v1/posts */
+async function publish(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const key = req.headers['idempotency-key'];
+  const body = await readBody(req);
+
+  if (typeof key === 'string') {
+    const already = publishedByKey.get(key);
+    if (already !== undefined) {
+      send(res, 201, already, { Location: `/v1/posts/${already.id}`, ETag: `"${already.revision}"` });
+      return;
+    }
+  }
+
+  const text = textOrNull(body);
+  if (text === null) {
+    fail(res, 'validation_failed', 400, 'Your post must be between 1 and 500 characters.', false);
+    return;
+  }
+
+  // Minted from the wall clock, so the new ID is strictly greater than every fixture ID and the
+  // post belongs at the head of the timeline. That ordering is the whole reason a publish and an
+  // in-flight "load more" cannot collide.
+  const createdAt = new Date().toISOString();
+  const post: Post = {
+    id: snowflake(createdAt, 676, publishedByKey.size),
+    author: VIEWER,
+    text,
+    image: null,
+    created_at: createdAt,
+    revision: 1,
+    edited_at: null,
+    edit_count: 0,
+    editable_until: new Date(Date.parse(createdAt) + 15 * 60_000).toISOString(),
+  };
+
+  state.posts = [post, ...state.posts];
+  revisions.set(post.id, [{ revision: 1, text, created_at: createdAt }]);
+  if (typeof key === 'string') publishedByKey.set(key, post);
+
+  send(res, 201, post, { Location: `/v1/posts/${post.id}`, ETag: `"${post.revision}"` });
+}
+
 export function chirpMock(): Plugin {
   return {
     name: 'chirp-mock',
@@ -110,6 +187,16 @@ export function chirpMock(): Plugin {
               return;
             }
             getHomeTimeline(url, res);
+            return;
+          }
+
+          if (method === 'POST' && path === '/posts') {
+            const fault = maybeFault(url, 'publish');
+            if (fault !== null) {
+              sendFault(res, fault);
+              return;
+            }
+            await publish(req, res);
             return;
           }
 

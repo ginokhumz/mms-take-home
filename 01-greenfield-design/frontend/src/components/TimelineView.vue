@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted } from 'vue';
 import { useTimelineStore } from '../stores/timeline';
+import ComposeBox from './ComposeBox.vue';
 import PostCard from './PostCard.vue';
 import ErrorPanel from './ErrorPanel.vue';
 import DegradedBanner from './DegradedBanner.vue';
@@ -11,6 +12,10 @@ onMounted(() => void store.loadFirstPage());
 
 <template>
   <section>
+    <!-- Compose sits above every state, including the error one: a timeline that failed to load
+         is no reason to stop someone posting. Pending entries render inside it, above the list. -->
+    <ComposeBox />
+
     <DegradedBanner v-if="store.degraded" />
 
     <p v-if="store.status === 'loading-first'">Loading your timeline…</p>
