@@ -1,6 +1,6 @@
 import type { Plugin } from 'vite';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import type { Post, TimelinePage } from '../src/api/types';
+import type { Post, RevisionsResponse, TimelinePage } from '../src/api/types';
 import { posts, revisions, VIEWER } from './corpus';
 import { encodeCursor, decodeCursor, snowflake } from './snowflake';
 import { faultResponse, maybeFault } from './faults';
@@ -81,6 +81,17 @@ function getHomeTimeline(url: URL, res: ServerResponse): void {
     degraded: url.searchParams.get('degraded') === '1',
   };
   send(res, 200, page);
+}
+
+/** GET /v1/posts/{id}/revisions — public, newest first, not paginated. */
+function getRevisions(id: string, res: ServerResponse): void {
+  const history = revisions.get(id);
+  if (history === undefined) {
+    fail(res, 'post_not_found', 404, 'This post is no longer available.', false);
+    return;
+  }
+  const body: RevisionsResponse = { post_id: id, revisions: history };
+  send(res, 200, body);
 }
 
 function delay(ms: number): Promise<void> {
@@ -187,6 +198,17 @@ export function chirpMock(): Plugin {
               return;
             }
             getHomeTimeline(url, res);
+            return;
+          }
+
+          const revisionsMatch = /^\/posts\/(\d+)\/revisions$/.exec(path);
+          if (method === 'GET' && revisionsMatch !== null) {
+            const fault = maybeFault(url, 'revisions');
+            if (fault !== null) {
+              sendFault(res, fault);
+              return;
+            }
+            getRevisions(revisionsMatch[1] ?? '', res);
             return;
           }
 

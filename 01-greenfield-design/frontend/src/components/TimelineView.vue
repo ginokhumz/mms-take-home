@@ -1,13 +1,23 @@
 <script setup lang="ts">
-import { onMounted } from 'vue';
+import { onMounted, ref } from 'vue';
 import { useTimelineStore } from '../stores/timeline';
+import type { PostId } from '../api/types';
 import ComposeBox from './ComposeBox.vue';
 import PostCard from './PostCard.vue';
 import ErrorPanel from './ErrorPanel.vue';
 import DegradedBanner from './DegradedBanner.vue';
+import EditedIndicator from './EditedIndicator.vue';
+import RevisionsPanel from './RevisionsPanel.vue';
 
 const store = useTimelineStore();
 onMounted(() => void store.loadFirstPage());
+
+// One panel open at a time, and the history is fetched when it opens rather than with the page:
+// most posts are never edited, so paying for their history on every timeline load would be waste.
+const openRevisions = ref<PostId | null>(null);
+function toggleRevisions(id: PostId): void {
+  openRevisions.value = openRevisions.value === id ? null : id;
+}
 </script>
 
 <template>
@@ -32,7 +42,14 @@ onMounted(() => void store.loadFirstPage());
     </p>
 
     <template v-else>
-      <PostCard v-for="post in store.items" :key="post.id" :post="post" />
+      <PostCard v-for="post in store.items" :key="post.id" :post="post">
+        <template #meta>
+          <EditedIndicator :post="post" @toggle="toggleRevisions(post.id)" />
+        </template>
+        <template #footer>
+          <RevisionsPanel v-if="openRevisions === post.id" :post-id="post.id" />
+        </template>
+      </PostCard>
 
       <!-- Below the list, never in place of it: the reader keeps the posts they already had. -->
       <ErrorPanel
