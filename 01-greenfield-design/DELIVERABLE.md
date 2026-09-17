@@ -2958,4 +2958,39 @@ telemetry, and until then the capacity model is unvalidated.
 
 ## 14. Trade-offs and what you would do with more time
 
-What you traded away deliberately. What you would build next, in order, and why that order.
+### 14.1 Traded away deliberately
+
+| Traded away | For | Cost I accepted |
+|---|---|---|
+| One read path (pure push, §11.1) | Surviving the 3M-follower post, which costs 7.5 cluster-seconds | k-way merge on every read, one cursor over two sets, a dial with no safe direction (§7.5) |
+| Denormalised post bodies in the timeline (§11.2) | Edits propagating for free — IDs only in the list, body hydrated per read | 347,222 hydrations/s and therefore bottleneck #2 (§7.1 row 2) |
+| Synchronous indexing and synchronous purge (§11.3, §11.4) | 201 latency, and a purge that cannot stall on 3M list entries | Two named inconsistency windows: ≤5 s searchable, ≤24 h purged (§12) |
+| Strong read-your-writes on the timeline | The whole asynchronous write path | Self-visibility patched client-side at the API edge, not in the store |
+| Multi-region | Simplicity, and a 3x diurnal peak instead of a flat one (§7.0) | No region-loss story; §8 stops at zone loss |
+
+Scope I did not design at all, per §1: DMs, notifications, trending, ranking, moderation policy
+(hook located in §9 and left there).
+
+### 14.2 What I would build next, in this order
+
+The order is §13's, because all three weaknesses sit in the same read budget and the first two
+items are measurements, not code. Building before measuring would be building against numbers I
+have already admitted I guessed.
+
+1. **Measure `wide_followees_per_viewer` and `timeline_requests_per_active_user_per_day`**
+   (§13.1, §13.3). A week of telemetry. Everything below is ranked by figures these two either
+   confirm or invalidate — if the mean wide-followee count is 40 rather than 0–3, the read path is
+   27.8x over budget and item 3 becomes item 1.
+2. **Derive the post store's 25,000 reads/s** on a cluster actually sized for 19.4 TB (§13.2).
+   It is the denominator under §7.1's ranking and under the 384 GB of replicas §8.4 buys.
+3. **Price and bound the read-time merge**: a per-viewer cap on wide followees, or a materialised
+   per-wide-author recent-posts cache so the merge reads cache rather than `posts_by_author`. This
+   is the fix that gives the §11.1 threshold a safe direction to move in.
+4. **A read-path load test at the §7.0 peak** (17,361 req/s) with one cache shard flushed, to see
+   whether `degraded: true` (§5.1) holds at 1.4x or is decorative.
+5. **Multi-region reads**, once the single-region read budget is real rather than assumed. Not
+   before — replicating a read path I cannot size is replicating the uncertainty.
+
+Items 1 and 2 are days of work and change the ranking of everything else. That is why they are
+first, and why I would resist building item 3 on the current numbers even though it is the
+interesting one.
