@@ -139,12 +139,17 @@ consistency: if the code and the document disagree, both lose marks.
 Debrief will ask: why this state approach, what happens when the optimistic write races "load
 more", and what changes if the contract gains a field. Have answers.
 
-**Code comments cite the contract, never the planning docs.** `§5.0`, `§5.5`, `§3.3` and the like
-point at `DELIVERABLE.md` and stay — they are the evidence that the code implements the document,
-which is the highest-weighted mark. References to `PLAN.md`, `BUILD-PLAN.md` or `SPEC.md` do not
-belong in shipped code: those files are scaffolding for building it, not part of the artefact, and
-a reader of the frontend should never be sent to a plan to understand a line. Keep the reasoning,
-drop the pointer — write the argument out in prose instead.
+**No section references in code. None, to any document.** Not `PLAN.md`, `BUILD-PLAN.md` or
+`SPEC.md`, and not `§5.0`/`§5.5`/`§3.3` pointing at `DELIVERABLE.md` either. The frontend has to
+read as a standalone artefact: a reader should never have to open another file to understand a
+line, and `§` markers rot the moment a section is renumbered. Keep the reasoning, drop the
+pointer — state the rule itself in prose ("IDs cross the wire as strings because 2^63 exceeds
+`Number.MAX_SAFE_INTEGER`", not "§5.0 says IDs are strings"). Referring to *the contract* in
+words is fine; citing a numbered section of it is not.
+
+The consequence is that `frontend/README.md` carries the whole burden of proving contract
+consistency, which is the highest-weighted mark. Its contract-to-module map has to be thorough
+and current: per module and per endpoint, including the endpoints deliberately not consumed.
 
 ## Useful tools and skills for Section 01
 
