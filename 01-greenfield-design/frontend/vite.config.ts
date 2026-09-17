@@ -2,8 +2,9 @@
 // vite export does not type it.
 import { defineConfig } from 'vitest/config';
 import vue from '@vitejs/plugin-vue';
+import { chirpMock } from './mock/router';
 
 export default defineConfig({
-  plugins: [vue()],
+  plugins: [vue(), chirpMock()],
   test: { environment: 'node', include: ['src/**/*.spec.ts'] },
 });

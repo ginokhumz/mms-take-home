@@ -12,7 +12,7 @@ const wire = {
 };
 
 describe('parseApiError', () => {
-  it('preserves every §5.5 field, retryable included', () => {
+  it('preserves every field of the error model, retryable included', () => {
     const err = parseApiError(409, wire, 'fallback-id');
     expect(err).toBeInstanceOf(ApiError);
     expect(err.status).toBe(409);
@@ -35,7 +35,7 @@ describe('parseApiError', () => {
     expect(parseApiError(409, body, 'fallback-id').retryable).toBe(true);
   });
 
-  it('synthesises a §5.5-shaped error when the body is not §5.5-shaped', () => {
+  it('synthesises a contract-shaped error when the body is not contract-shaped', () => {
     const err = parseApiError(502, '<html>gateway</html>', 'x-req-7');
     expect(err.code).toBe('internal_error');
     expect(err.retryable).toBe(true); // 502: transport-level, safe to retry

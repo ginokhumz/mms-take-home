@@ -1,6 +1,6 @@
 /**
- * §5.5: every non-2xx response carries { error: { code, message, retryable, request_id, details? } }
- * and nothing else ever appears in an error position. The frontend switches on `code`, never on
+ * Every non-2xx response carries { error: { code, message, retryable, request_id, details? } } and
+ * nothing else ever appears in an error position. The frontend switches on `code`, never on
  * `message`, and shows a retry affordance if and only if `retryable` is true.
  */
 export class ApiError extends Error {
@@ -33,7 +33,7 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 }
 
 /**
- * Narrows an unknown response body into an ApiError. A body that is not §5.5-shaped means
+ * Narrows an unknown response body into an ApiError. A body that is not contract-shaped means
  * something outside the contract answered (a proxy, a crash), so we synthesise the contract's
  * own unclassified code rather than surfacing foreign text to the user.
  */
@@ -43,8 +43,8 @@ export function parseApiError(status: number, body: unknown, fallbackRequestId: 
     const code = typeof e['code'] === 'string' ? e['code'] : 'internal_error';
     const message =
       typeof e['message'] === 'string' ? e['message'] : 'Something went wrong. Please try again.';
-    // Fallback only if the server omitted the field, which §5.5 says never happens. It must match
-    // the fallback below: 429 is retryable per §5.5, so `status >= 500` alone would be wrong.
+    // Fallback only if the server omitted the field, which the contract says never happens. It
+    // must agree with the fallback below: 429 is retryable, so `status >= 500` alone is wrong.
     const retryable =
       typeof e['retryable'] === 'boolean' ? e['retryable'] : status === 429 || status >= 500;
     const requestId = typeof e['request_id'] === 'string' ? e['request_id'] : fallbackRequestId;
@@ -65,7 +65,7 @@ export function parseApiError(status: number, body: unknown, fallbackRequestId: 
   });
 }
 
-/** §5.5: only 429 and 503 should ever drive an automatic retry. */
+/** Only 429 and 503 should ever drive an automatic retry. */
 export function isAutoRetryable(err: ApiError): boolean {
   return err.retryable && (err.status === 429 || err.status === 503);
 }
