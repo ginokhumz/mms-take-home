@@ -159,7 +159,7 @@ graph TB
   LOG --> PW[Purge workers]
 
   FW -->|followers of narrow authors| FGS[(Follow graph store<br/>followers_by_user /<br/>following_by_user)]
-  FW -->|LPUSH post_id| TL[(Timeline store<br/>Redis list per user<br/>+ cold backing store)]
+  FW -->|LPUSH post_id| TL[(Timeline store<br/>Redis list per user<br/>newest 800 entries)]
   IX --> SI[(Search index<br/>OpenSearch, refresh 1s)]
   PW --> TL
   PW --> PDB
@@ -265,7 +265,8 @@ the post cache, so the read path degrades to "no new posts" rather than an outag
 
 **Responsibility.** The durable record of every post and every revision. Source of truth.
 **Stores.** `posts` (partition key `post_id`) and `post_revisions` (partition `post_id`, clustering
-`revision`). ~1.5 B posts/month × ~600 B ≈ **900 GB/month** of bodies and metadata (§2).
+`revision`). ~1.52 B posts/month × ~355 B ≈ **540 GB/month** raw, **1.62 TB/month** at RF 3. The
+per-row breakdown is in §6.2.
 **Scales.** Wide-column store (Cassandra/ScyllaDB) partitioned by `post_id`. Post IDs are
 time-ordered but hashed into partitions, so writes spread rather than hot-spotting the newest
 shard. Growth is linear and additive.
@@ -349,9 +350,9 @@ posts are unaffected. This is the inverse failure of §4.6, which is the point o
 **Responsibility.** `follow`/`unfollow`, `followers_of(user)` paged, `following(user)`, the
 `is_wide` flag, and the per-user `wide_followees` set the read path needs. Storage internals are
 out of scope per the prompt; this is the interface the timeline depends on.
-**Stores.** `followers_by_user` (partition `user_id`, clustering `follower_id`) and
+**Stores.** `followers_by_user` (partition `(user_id, bucket)`, clustering `follower_id`; §6.6) and
 `following_by_user`. ~1 B edges at 20M × 50 (§2.1).
-**Scales.** Partitioned by `user_id`. Wide accounts' follower partitions are huge — they are only
+**Scales.** Partitioned by `user_id`, with follower lists split into 10,000-edge buckets (§6.6). Wide accounts' follower partitions are huge — they are only
 read by purge, never by fanout, which is why the hybrid keeps them cold.
 **Unavailable.** Follow/unfollow returns 503. Fanout stalls (it cannot list followers); read-time
 merge degrades to the last cached `wide_followees` set.
@@ -729,8 +730,12 @@ the edit hydrates revision N+1. Both are correct views of different read times; 
 
 **How a client retries a publish safely.** The client generates a UUIDv4 before the first attempt and
 reuses it for every retry of *that* post. The post service stores `(user_id, key) → (request hash,
-status, response body)` for 24 hours, written in the same partition transaction as the post row —
-so a crash between "post written" and "key recorded" is impossible.
+status, reserved post_id, response body)` for 24 hours. The key row and the post row are in
+different partitions and cannot be written atomically, so the server **reserves before it writes**:
+mint the `post_id`, insert the key row as `in_progress` carrying that ID, write the post, mark the
+key `completed`. A retry that finds `in_progress` looks up the reserved `post_id` and either returns
+the post that is already there or re-drives the write with that same ID. A crash at any point
+therefore yields one post or none, never two. §6.8 has the table.
 
 - Same key, same body, original completed → 201 with the stored body. The client sees one post.
 - Same key, same body, original still in flight → `409 idempotency_in_progress`, retryable after
@@ -791,11 +796,384 @@ contract.
 
 ## 6. Data model
 
-Entities, fields, keys, indexes and relationships. State your partitioning or sharding key for
-each store and justify it against the access patterns in section 5.
+One rule generates most of what follows: **the post body is stored in exactly one place.** Every
+other store holds IDs and points at it. That is what makes an edit a single-row update plus one
+cache delete (§11.2), and a purge an enumeration rather than a rewrite (§11.4).
 
-Say explicitly how you store: the post, the edit history, the materialised timeline (if you use
-one), the follow graph, and the search document.
+### 6.1 Stores at a glance
+
+| Store | Technology | Partition / shard key | Holds |
+|---|---|---|---|
+| Post store | Cassandra / ScyllaDB | `post_id`, `author_id`, `(user_id, key)` per table | Posts, revisions, author index, idempotency records |
+| Timeline store | Redis cluster | `user_id` | Materialised push set, 800 entries |
+| Follow graph store | Cassandra | `(user_id, bucket)` and `user_id` | Follower and following edges |
+| Search index | OpenSearch | Daily index, doc `_id = post_id` | The searchable document |
+| Post cache | Redis cluster | `post_id` | Rendered post JSON |
+| Read caches | Redis cluster | `user_id` | Follow-graph read set, tombstones |
+| Object store | S3-compatible | Object key | Image original and variants |
+
+### 6.2 The post
+
+```sql
+CREATE TABLE posts (
+  post_id     bigint,      -- Snowflake (§3.3): 41-bit ms | 10-bit shard | 12-bit seq
+  author_id   bigint,
+  text        text,        -- current revision, <= 500 code points (§5.1)
+  media_id    uuid,        -- null when the post has no image
+  alt         text,
+  created_at  timestamp,   -- authoritative; the 15-minute window is measured from this
+  revision    int,         -- 1 on publish
+  edit_count  int,
+  edited_at   timestamp,   -- null until the first edit
+  PRIMARY KEY ((post_id))
+);
+```
+
+**Partition key `post_id`, one row per partition.** Justified by §5: endpoint 3 and every timeline
+hydration (§3.4 step 5) are point lookups by post ID, and hydration issues a multi-get of ~20 IDs
+that scatters evenly across the ring precisely *because* the partitions are single-row. There is no
+access pattern anywhere in §5 that reads a range of posts by time across all authors — search does
+that, and search is OpenSearch's job.
+
+Post IDs are time-ordered but the **partitioner hashes them**, so today's writes spread across the
+ring instead of hot-spotting one partition (§4.3).
+
+Sizing, refining the estimate in §4.3:
+
+```
+post_id 8 + author_id 8 + created_at 8 + text 182 (140 chars avg, ~1.3 B/char UTF-8)
+        + media_id 2 (16 B on the 15% of posts with an image) + revision/edit_count/edited_at 14   =   222 B
+x 1.6 wide-column per-cell overhead (column names, cell timestamps)        =   355 B
+1,522,000,000 posts/month x 355 B                                          =   540 GB/month raw
+x RF 3                                                                     =  1.62 TB/month on disk
+```
+
+`text` is duplicated between `posts` and `post_revisions` below. That is deliberate: hydration is
+the hottest read in the system and must not do two reads to render one post. Both tables share the
+partition key `post_id`, so publish and edit write them in a **single-partition logged batch** —
+same token, same replica set, atomic and cheap.
+
+### 6.3 The edit history
+
+```sql
+CREATE TABLE post_revisions (
+  post_id    bigint,
+  revision   int,
+  text       text,
+  created_at timestamp,
+  PRIMARY KEY ((post_id), revision)
+) WITH CLUSTERING ORDER BY (revision DESC);
+```
+
+**Same partition key as `posts`.** §5 endpoint 5 is therefore one partition read, already
+newest-first, and needs no pagination — the 15-minute window bounds the row count per partition to
+something tiny. Revision 1 is written at publish, so history is never missing its origin.
+
+Append-only. An edit writes revision N+1 and updates `posts.text`/`revision`/`edited_at`; it never
+mutates a prior revision. Storage cost at an assumed 5% of posts edited, 1.4 edits each:
+
+```
+1,522,000,000 x 0.05 x 1.4 = 107M revision rows/month x 355 B = 38 GB/month  (7% on top of posts)
+```
+
+### 6.4 The author index
+
+```sql
+CREATE TABLE posts_by_author (
+  author_id bigint,
+  post_id   bigint,
+  PRIMARY KEY ((author_id), post_id)
+) WITH CLUSTERING ORDER BY (post_id DESC);
+```
+
+A hand-maintained index, not a Cassandra secondary index — a secondary index would scatter the
+query to every node, and this is on the timeline read path. Written on publish in the same request
+as the post row.
+
+One table, three access patterns, which is why it is worth its write cost:
+
+1. **The pull half of the hybrid** (§3.4 step 2): `WHERE author_id = ? AND post_id < ? LIMIT n` —
+   exactly the cursor semantics of §5.3, served as one clustering-range read.
+2. **Timeline rebuild** after a Redis shard loss (§4.7), by unioning this over the viewer's
+   followees.
+3. **Purge enumeration**: "every post this deleted author wrote" (§4.13).
+
+Hot tier retains the newest ~1,000 IDs per author (§4.9) — `1,000 x 24 B = 23 KB` per partition,
+which is why wide authors' partitions cache trivially.
+
+### 6.5 The materialised timeline
+
+Not a table. A Redis list per user:
+
+```
+key    tl:{user_id}
+value  LIST of 16-byte packed entries:  [post_id int64 | author_id int64]
+write  LPUSH tl:{user_id} <entry>  ;  LTRIM tl:{user_id} 0 799
+read   LRANGE for the page, or scan-to-cursor for page 2+
+```
+
+**Shard key `user_id`**, so a user's entire push set lives on one node and a page is one round trip
+— the dominant read in §5 (endpoint 2) costs one network hop.
+
+```
+16 B packed + ~8 B Redis quicklist node overhead        =  24 B/entry
+20,000,000 users x 800 entries x 24 B                   = 384 GB   (matches §4.7)
+```
+
+**`author_id` is stored alongside `post_id` even though it is derivable** from the post. It has to
+be: the tombstone and unfollow filters in §3.4 step 4 run *before* hydration, so the merge must know
+each entry's author without fetching the post. Eight extra bytes buys the filter.
+
+**No body, ever.** This is the single most load-bearing choice in the design. An edit touches
+`posts` and deletes one cache key; the 3,000,000 timelines referencing that post in §12 are not
+written to at all.
+
+**There is no cold copy beyond 800 entries.** Deep pagination falls through to `posts_by_author`
+(§6.4) — slower, but no second store to keep consistent.
+
+A companion key `tlmeta:{user_id}` holds `built_at`. Its **absence** is how the timeline service
+distinguishes "this user genuinely has no posts" (200 with `items: []`) from "this shard was lost"
+(200 with `degraded: true`, §5.1 endpoint 2). Without it those two cases are the same empty `LRANGE`.
+
+### 6.6 The follow graph
+
+Storage internals are out of scope (§1.2); this is the shape the timeline and purge paths require.
+
+```sql
+CREATE TABLE followers_by_user (          -- "who follows X", for fanout and purge
+  user_id     bigint,
+  bucket      int,
+  follower_id bigint,
+  created_at  timestamp,
+  PRIMARY KEY ((user_id, bucket), follower_id)
+);
+
+CREATE TABLE following_by_user (          -- "who X follows", for the read path
+  user_id     bigint,                     -- the follower
+  followee_id bigint,
+  bucket      int,                        -- where the reverse edge landed
+  is_wide     boolean,                    -- denormalised snapshot of the followee's class
+  created_at  timestamp,
+  PRIMARY KEY ((user_id), followee_id)
+);
+```
+
+**`bucket` exists because of the skew figure**, and it is the one place the prompt's top-0.1%
+constraint reaches into the physical model:
+
+```
+follower_id 8 + created_at 8 = 16 B, x 1.6 per-cell overhead (as §6.2)  = ~26 B/edge
+3,000,000 followers x 26 B in one partition = 78 MB, 3,000,000 rows
+Cassandra guidance: keep partitions under ~100 MB and ~100,000 rows
+  -> bytes are inside the guidance; rows are 30x over it. Row count is what forces the split.
+At 10,000 edges per bucket: 3,000,000 / 10,000 = 300 partitions of 260 KB each
+A narrow author at the 99,999-follower ceiling (§3.3) = 10 partitions -> 10 reads per fanout
+An average 50-follower account                        =  1 partition
+```
+
+Buckets fill in **append order**. `users.active_bucket` (int) names the bucket new edges go into,
+and a counter table tracks how full each bucket is:
+
+```sql
+CREATE TABLE bucket_fill (user_id bigint, bucket int, edges counter,
+                          PRIMARY KEY ((user_id), bucket));
+```
+
+A follow writes into `active_bucket` and increments `edges`; when `edges` reaches 10,000 the follow
+service advances the pointer with a lightweight transaction,
+`UPDATE users SET active_bucket = n+1 WHERE user_id = ? IF active_bucket = n`, so two services racing
+to advance it cannot skip a bucket. Append order, not a hash, because both consumers walk buckets
+sequentially and want to checkpoint: fanout pages followers (§4.6) and purge resumes from a bucket
+index (§4.13). At the 24 h budget, a 300-bucket account allows **288 s per bucket**, which is why
+purging a 3M-follower account is comfortable rather than tight.
+
+`following_by_user.bucket` is what makes unfollow a point delete: without it, removing one reverse
+edge would mean searching 300 partitions for the row.
+
+**What the bucket scheme does not guarantee**, stated so it is not mistaken for an oversight:
+
+- **Buckets overfill under concurrent follows.** The fill check and the pointer advance are not
+  atomic with the edge write (a counter cannot take part in a conditional update), so every follow
+  that lands between "edges hit 10,000" and "pointer advanced" still goes into the full bucket.
+  Overfill ≈ follow rate × advance latency. Assuming a viral account gains 1,000 followers/s and an
+  LWT round-trip takes ~50 ms: 1,000 x 0.05 = ~50 extra edges, 0.5% over target. 10,000 is a
+  target, not a limit; the ceiling that matters is 100,000 rows, 10x away.
+- **Unfollows leave holes that are never compacted.** New edges only go into the active bucket, so
+  an old account's bucket 0 can shrink from 10,000 to 2,000 edges and stay there. Cost is extra
+  partitions per fanout or purge walk, not correctness: 3M followers with 30% churned still spans
+  300 buckets holding 2.1M edges, 30% of reads wasted. Rebucketing would move edges under a live
+  fanout, which the checkpointed walk cannot tolerate, so it is not done.
+- **A follow is three writes to three partitions.** The two edge rows (`following_by_user`,
+  `followers_by_user`) go in a **multi-partition logged batch**: if the coordinator dies mid-write,
+  the batchlog replays it, so the pair converges rather than half-existing. That is eventual, not
+  isolated — for up to the batchlog replay delay a follower can have the forward edge without the
+  reverse one, and a post fanned out in that window misses them (the 60 s `fg:` cache already
+  allows a window this size). The `bucket_fill` and `follower_count` increments cannot join the batch
+  (Cassandra rejects counters in a mixed batch) and are not idempotent on retry, so both counters
+  drift. Accepted: `follower_count` only feeds the 100,000 `is_wide` threshold, and drift of a few
+  hundred at that scale does not flip a verdict; `bucket_fill` drift only moves the overfill point.
+
+Two small companions:
+
+```sql
+CREATE TABLE users (
+  user_id bigint PRIMARY KEY, handle text, display_name text,
+  avatar_media_id uuid, is_wide boolean, state text   -- active | deleting | deleted
+);
+CREATE TABLE user_counters (user_id bigint PRIMARY KEY, follower_count counter);
+```
+
+Counters live in their own table because Cassandra forbids mixing counter and non-counter columns.
+`is_wide` is the materialised verdict of `follower_count >= 100,000`, flipped by a job.
+
+**The wide/narrow flip is the hazard in this model.** When an author crosses the threshold, every
+`following_by_user.is_wide` flag pointing at them is stale, and during the flip a post can be *both*
+fanned out and pulled. That is survivable only because §4.8 de-duplicates by `post_id` at merge —
+the flip is the reason that de-duplication is not optional.
+
+**Read cache.** The read path cannot afford a Cassandra read per timeline request, so the viewer's
+followee set is cached as `fg:{user_id}` → hash of `followee_id → is_wide`, 60 s TTL. One structure
+serves both jobs in §3.4 step 4: membership is the unfollow filter, and the flagged subset is
+`wide_followees`. Stale-cache behaviour is exactly what §4.10 promises.
+
+```
+20,000,000 users x 50 followees x 17 B = 17 GB
+```
+
+### 6.7 The search document
+
+```json
+{
+  "_id":        "1827639201234567890",
+  "post_id":    "1827639201234567890",
+  "sort_id":    1827639201234567890,
+  "author_id":  "88213004",
+  "handle":     "grace",
+  "text":       "the post body",
+  "created_at": "2026-09-17T10:00:00.000Z",
+  "revision":   2,
+  "has_image":  true
+}
+```
+
+**`_id = post_id` is the whole edit and replay story for search.** Indexing an edit is an
+overwrite, not a second document, so a post can never appear twice in results; and a duplicate
+Kafka delivery re-indexes identical content, which makes the indexer idempotent (§4.5) for free.
+
+`sort_id` is the numeric twin of `post_id`, present so §5.1 endpoint 6's cursor is a `range` filter
+(`sort_id < cursor`) on the same descending order the timeline uses. The API renders it back as a
+string (§5.0).
+
+**Index per day**, `posts-YYYY-MM-DD`, `refresh_interval: 1s` (§4.11). Daily slicing means the write
+load hits one hot index, retention is an index drop rather than a delete-by-query, and a query with
+no date filter fans out over aliases.
+
+```
+source ~210 B/doc; inverted index ~1.3x source
+1.52B docs/month x 210 B x 2.3 = 0.73 TB/month per replica
+```
+
+The document carries `handle`, duplicated from `users`, so a result renders without a join. It goes
+stale on a handle change — accepted, because search results are re-hydrated against the post cache
+before display (§4.11) and the index copy is only used for matching.
+
+### 6.8 Idempotency records
+
+```sql
+CREATE TABLE idempotency_keys (
+  user_id      bigint,
+  key          uuid,
+  request_hash blob,
+  status       text,     -- in_progress | completed
+  post_id      bigint,   -- reserved before the post is written
+  response     blob,
+  PRIMARY KEY ((user_id, key))
+) WITH default_time_to_live = 86400;   -- the 24 h window promised in §5.4
+```
+
+Partitioned by `(user_id, key)` so a retry is a point read on the path it needs to be fast on.
+
+This table is in a **different partition from the post row**, so the two cannot be written
+atomically. The publish path therefore *reserves* rather than *records*: mint `post_id` → insert
+the key row `in_progress` carrying that `post_id` → write the post and revision 1 → update the key
+row to `completed`. A retry that finds `in_progress` reads `posts` by the reserved `post_id`: if the
+row is there it returns 201 with it, and if it is not it re-drives the write **with the same
+`post_id`**, which is idempotent because the ID was fixed before the crash. No interleaving produces
+two posts.
+
+### 6.9 Caches and tombstones
+
+| Key | Value | TTL | Invalidated by |
+|---|---|---|---|
+| `post:{post_id}` | Rendered post JSON, ~700 B | 48 h | `DEL` on edit (§11.2) |
+| `fg:{user_id}` | Followee → `is_wide` hash | 60 s | TTL, and on follow/unfollow |
+| `tomb:authors` | Set of deleted `author_id` | Until purge completes | Purge completion (§4.13) |
+
+`post:{post_id}` embeds the author's handle and display name so hydration is one multi-get, which
+means a display-name change is visible only as cached copies expire — up to 48 h. Accepted and
+recorded in §8. Deletion is *not* subject to that staleness, because the tombstone filter runs
+before hydration and never consults the cached copy.
+
+The tombstone set stays small: at an assumed 0.01% of 20M actives deleting per day, `2,000
+entries x 8 B = 16 KB` held for at most 24 h. It is cheap to replicate to every timeline service
+instance, which is what makes a per-entry filter check free.
+
+### 6.10 Media
+
+```sql
+CREATE TABLE media (
+  media_id uuid PRIMARY KEY, owner_id bigint, state text,  -- presigned | uploaded | ready | rejected
+  content_type text, byte_size int, width int, height int, sha256 blob, created_at timestamp
+);
+```
+
+Object keys are `m/{media_id}/orig`, `m/{media_id}/1280.webp`, `m/{media_id}/640.webp` — derivable
+from `media_id` alone, so `posts` stores only the UUID and no URLs. `state` is what §5.1 endpoint 1
+checks to return `409 media_not_ready`. Rows in `presigned` or `uploaded` with no referencing post
+after 24 h are the orphan-collection target.
+
+### 6.11 Relationships
+
+```mermaid
+erDiagram
+  USERS ||--o{ POSTS : authors
+  POSTS ||--|{ POST_REVISIONS : "has 1..n"
+  POSTS ||--o| MEDIA : "references 0..1"
+  USERS ||--o{ POSTS_BY_AUTHOR : indexes
+  POSTS_BY_AUTHOR }o--|| POSTS : "id only"
+  USERS ||--o{ FOLLOWING_BY_USER : follows
+  USERS ||--o{ FOLLOWERS_BY_USER : "followed by"
+  USERS ||--o| TIMELINE_LIST : "has push set"
+  TIMELINE_LIST }o--|| POSTS : "post_id + author_id, no body"
+  POSTS ||--o| SEARCH_DOC : "projected, _id = post_id"
+```
+
+### 6.12 Access pattern → store
+
+Every endpoint in §5, and what it touches. If a row here needed a scan or a secondary index, the
+model would be wrong.
+
+| §5 endpoint | Reads / writes | Key used | Cost |
+|---|---|---|---|
+| 1 publish | `idempotency_keys` → `posts` + `post_revisions` (batch) → `posts_by_author` → outbox | `(user_id,key)`, `post_id`, `author_id` | 4 single-partition writes |
+| 2 home timeline | `tl:{uid}` + `fg:{uid}` + `posts_by_author` (wide only) + `post:{id}` multi-get | `user_id`, then `post_id` | 1 hop + 0–3 range reads + 1 multi-get |
+| 3 single post | `post:{id}`, miss → `posts` | `post_id` | 1 point read |
+| 4 edit | `posts` read, window check, batch write both tables, `DEL post:{id}` | `post_id` | 1 read + 1 batch + 1 del |
+| 5 revisions | `post_revisions` | `post_id` | 1 partition read, pre-sorted |
+| 6 search | OpenSearch, then `post:{id}` multi-get | `sort_id` range | 1 query + 1 multi-get |
+| 7/8 follow | `users.active_bucket` → logged batch of `following_by_user` + `followers_by_user` → `bucket_fill` + `follower_count` increments | `user_id`, `(user_id,bucket)` | 1 read + 1 batch (2 edges) + 2 counter writes; LWT only when a bucket fills |
+| 9 delete account | `users.state`, `tomb:authors`, then async walk of `posts_by_author` and follower buckets | `author_id`, `(user_id,bucket)` | 2 sync writes, rest background |
+| 10 media | `media` insert | `media_id` | 1 write |
+
+### 6.13 What is deliberately not stored
+
+| Not stored | Why |
+|---|---|
+| Post body in timeline entries | The edit and purge story (§6.5) |
+| `follower_count` on a post or in the API | Internal routing input only (§5.0) |
+| A reverse index of "which timelines contain post P" | Never queried. Purge walks the author's followers instead, which is the same set and already exists |
+| Timeline entries older than 800 | `posts_by_author` reconstructs them (§6.5) |
+| Per-viewer read state, seen markers | Not in scope (§1.2), and it would be 20M × 800 rows of write amplification on the read path |
 
 ---
 
