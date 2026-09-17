@@ -16,7 +16,16 @@ interface FaultSpec {
   details?: Record<string, unknown>;
 }
 
-/** Keys are the contract's `code` enum. Adding a row is the only way to add a reachable fault. */
+/**
+ * Keys are the contract's `code` enum, every row of it. Adding a row is the only way to add a
+ * reachable fault.
+ *
+ * Several codes belong to endpoints this view never calls — search, follow, account deletion and
+ * media upload. They are here because the contract promises any code in the table can be produced
+ * without editing code, and a list that quietly stopped at the four consumed endpoints would make
+ * that promise false. Forcing one of them on a consumed endpoint is also the cheapest way to see
+ * that the error rendering is driven by the model and not by a per-code branch.
+ */
 export const FAULTS: Record<string, FaultSpec> = {
   validation_failed: {
     status: 400,
@@ -28,10 +37,17 @@ export const FAULTS: Record<string, FaultSpec> = {
     message: 'This page link is no longer valid. Start from the top.',
     retryable: false,
   },
+  confirm_mismatch: {
+    status: 400,
+    message: 'The confirmation did not match. Nothing has been deleted.',
+    retryable: false,
+  },
   unauthenticated: { status: 401, message: 'Please sign in again.', retryable: false },
   token_expired: { status: 401, message: 'Your session expired.', retryable: false },
   not_author: { status: 403, message: 'You can only edit your own posts.', retryable: false },
+  cannot_follow_self: { status: 403, message: 'You cannot follow yourself.', retryable: false },
   post_not_found: { status: 404, message: 'This post is no longer available.', retryable: false },
+  user_not_found: { status: 404, message: 'This account is no longer available.', retryable: false },
   edit_window_closed: {
     status: 409,
     message: 'This post can no longer be edited.',
@@ -49,9 +65,29 @@ export const FAULTS: Record<string, FaultSpec> = {
     message: 'This post was already published.',
     retryable: false,
   },
+  media_not_ready: {
+    status: 409,
+    message: 'That image has not finished uploading yet.',
+    retryable: false,
+  },
+  purge_in_flight: {
+    status: 409,
+    message: 'This account is being deleted.',
+    retryable: false,
+  },
   revision_conflict: {
     status: 412,
     message: 'This post changed since you opened it. Reload to see the latest version.',
+    retryable: false,
+  },
+  image_too_large: {
+    status: 413,
+    message: 'That image is larger than 2 MB.',
+    retryable: false,
+  },
+  unsupported_media_type: {
+    status: 415,
+    message: 'Images must be JPEG, PNG or WebP.',
     retryable: false,
   },
   rate_limited: {
@@ -75,6 +111,18 @@ export const FAULTS: Record<string, FaultSpec> = {
   timeline_unavailable: {
     status: 503,
     message: 'Your timeline is temporarily unavailable.',
+    retryable: true,
+    retryAfter: 2,
+  },
+  search_unavailable: {
+    status: 503,
+    message: 'Search is temporarily unavailable.',
+    retryable: true,
+    retryAfter: 2,
+  },
+  follow_service_unavailable: {
+    status: 503,
+    message: 'Following is temporarily unavailable.',
     retryable: true,
     retryAfter: 2,
   },
