@@ -1618,9 +1618,146 @@ store, and I have not designed the failover (§14).
 
 ## 9. Security
 
-Cover at least: authentication and session handling, authorisation on edit and delete, abuse and
-rate limiting, image upload handling (content type, size, malicious payloads), output escaping
-for post bodies, personal data and what deletion actually removes, and transport.
+Everything here is public-by-default (§1.2), so this is not a confidentiality design. The assets
+actually worth protecting are three: **the integrity of authorship** (only Grace publishes and edits
+as Grace), **the availability of a system whose peak headroom is ~3×** (§7), and **the deletion
+promise** (§11.4). Each subsection below says which of those it protects.
+
+### 9.1 Authentication and session handling
+
+The scheme is in §5.2 and is not restated: EdDSA-signed 15-minute access token held in memory,
+opaque 30-day refresh token in an `HttpOnly; Secure; SameSite=Strict` cookie scoped to `/v1/auth`,
+rotated on every use, with a revoked-`sid` set consulted at the gateway. What that buys, and what it
+costs:
+
+| Threat | Control | Residual |
+|---|---|---|
+| XSS steals a long-lived credential | Access token never in `localStorage`/`sessionStorage`; refresh token unreadable by JS | XSS can still call the API *as* the user while the page is open — mitigated by §9.5, not by token storage |
+| Stolen refresh token replayed | Rotation with reuse detection: presenting a token already exchanged revokes the whole session family and forces re-login on every device | The attacker gets one window of ≤ 15 min before the legitimate client's next refresh trips detection |
+| CSRF on the refresh endpoint | `SameSite=Strict`, and the cookie is only valid on `/v1/auth`; every other endpoint takes a `Bearer` header, which cross-origin forms cannot set | — |
+| Credential stuffing | Per-account and per-IP throttle at login (10 failures/account/hour, then exponential lockout), password hashing with Argon2id, breach-list rejection at signup | Distributed low-and-slow stuffing across many IPs; needs the abuse detection in §9.3 |
+| Token forgery | Signature verified at the gateway against a key published by the identity service, rotated quarterly with two keys live | Key compromise; blast radius bounded by rotation |
+
+The revoked-`sid` set is the only per-request state lookup, and it is what makes `DELETE
+/v1/accounts/me` return with **all sessions dead** rather than dead in ≤ 15 minutes (§5.1 endpoint 9).
+At peak that is one extra cached set lookup on 17,361 timeline requests/s (§7.0) — a few percent of
+one Redis shard.
+
+### 9.2 Authorisation on edit and delete
+
+Authorship integrity. Three rules, all enforced in the **post service**, never at the gateway and
+never from a client-supplied field:
+
+1. `PATCH /v1/posts/{id}` and delete compare the token's `sub` against the row's `author_id` read
+   from the post store. Mismatch → `403 not_author` (§5.5). There is no admin override path in this
+   design; moderation take-downs go through the hook in §3.5 and are a separate authenticated
+   service identity, not a user token.
+2. The **15-minute edit window is a server-side check** against the stored `published_at`, ±0 grace,
+   client clock ignored (§1.3). Past it, `409 edit_window_closed` — the window is an authorisation
+   boundary, not a UI affordance, so a hand-rolled `PATCH` at minute 16 fails exactly like the UI.
+3. `If-Match` (§5.1 endpoint 4) is a concurrency guard, not an authorisation one. It is optional;
+   ownership is not.
+
+`DELETE /v1/accounts/me` takes no user ID at all — the path is `me`, resolved from `sub`. There is
+deliberately no endpoint that deletes *another* user's account, so there is nothing to get wrong.
+
+### 9.3 Abuse and rate limiting
+
+Availability. Limits are in §5.5; here is where they live and what they do **not** cover.
+
+- **Where the counter lives.** Redis, sliding-window counters keyed `rl:{scope}:{subject}:{window}`,
+  evaluated at the gateway (§4.1) before any service call, so a limited request costs one Redis
+  round trip and no database work. Subject is the token `sub` when authenticated, otherwise the
+  client IP — **/64 for IPv6**, since a single customer gets a /64 and per-address limiting is
+  free bypass.
+- **Counter load.** ~20,000 evaluations/s at peak across all endpoints; a single Redis shard handles
+  that, and the counters are shardable by subject if it ever does not.
+- **Fail-open, deliberately.** If the counter store is unavailable the gateway admits the request and
+  alerts. A rate limiter that fails closed converts a Redis blip into a total outage, and the assets
+  behind these limits are public posts.
+- **The honest gap.** Per-user limits do not bound fleet load. If every active user published at the
+  300/hour ceiling: `20,000,000 × 300 = 6 × 10⁹ posts/hour = 1,666,667 posts/s`, against a design
+  peak of 1,736 posts/s (§3.1) — **960× capacity**. Per-user limits stop one abusive account, not a
+  botnet of a million. The actual protections at that scale are (a) a global admission controller
+  shedding anonymous reads first, then search, then publish, keeping timeline reads last, and (b)
+  account-age and reputation gating so a freshly-created account gets 10 posts/hour, not 300.
+- **Fanout amplification is already defused.** The obvious economic attack — one post costing a
+  million writes — is what §11.1's wide-author pull path removes: a 1M-follower post costs one row,
+  not 1M (§2.1). Abuse of the *narrow* path is bounded by 100,000 followers × 300 posts/hour, which
+  is why the wide threshold is also a security parameter.
+
+### 9.4 Image upload handling
+
+The upload is a direct client `PUT` to the object store (§3.3), so the gateway never sees the bytes
+— which means every control has to be on the presign or on the post-upload validation.
+
+| Stage | Control |
+|---|---|
+| Presign (`POST /v1/media`) | URL is scoped to one exact key `m/{media_id}/orig`, method `PUT` only, 15-minute expiry, with `content-length-range` 1–2,097,152 and a pinned `Content-Type` condition. A presign cannot be turned into a 5 GB upload or a write to someone else's key. `media_id` is a v4 UUID, unguessable. |
+| Declared metadata | `413 image_too_large` / `415 unsupported_media_type` are **fast rejections only** (§5.1 endpoint 10). Nothing trusts them. |
+| After upload | The media service reads the object and validates **by magic bytes**, not extension or declared type. Allowed: JPEG, PNG, WebP. **SVG is rejected outright** — it is a script-bearing document, and no image feature here justifies it. |
+| Decompression bombs | Pixel dimensions are capped before decode at 8,192 × 8,192 = 67.1 M pixels, which is 256 MiB of RGBA in memory; anything larger is `rejected` without decoding. A 2 MB PNG can otherwise expand by three orders of magnitude and OOM the worker. |
+| Payloads inside valid images | Every accepted image is **re-encoded** into new WebP variants. The original's EXIF (including GPS), ICC profiles, and any appended polyglot payload do not survive re-encoding. The original is retained for the purge to delete, never served. |
+| Processing blast radius | Decoding runs in a sandboxed worker pool (no network, read-only filesystem, memory and CPU limits, separate service account) because image decoders are where memory-safety bugs live. A crash marks the row `rejected`, and the post is `409 media_not_ready`. |
+| Serving | Variants are served from a **separate domain** with no cookies, `X-Content-Type-Options: nosniff`, and a fixed `Content-Type` — so even a mis-classified file cannot be sniffed into an HTML document in the app's origin. |
+
+### 9.5 Output escaping and the browser
+
+Post bodies are user text and are stored **raw and unescaped** — escaping at write time corrupts the
+500-character count (§5.1), breaks the edit-history diff, and produces double-escaped text the moment
+two layers disagree. Escaping is a rendering concern:
+
+- The frontend (§01b) renders bodies as **React text nodes**. `dangerouslySetInnerHTML` appears
+  nowhere in the codebase, which is a lint rule, not a convention.
+- Auto-linking runs over the plain text with a **scheme allowlist of `http`/`https`**. `javascript:`,
+  `data:`, and `vbscript:` never become an `href`.
+- A CSP of `default-src 'self'; script-src 'self'; img-src https://img.chirp.example; object-src
+  'none'; base-uri 'none'; frame-ancestors 'none'` is the second line — it is what limits an XSS that
+  gets through §9.1's residual to something that cannot load an attacker's script or exfiltrate to an
+  arbitrary host.
+- Search queries (`q`) are passed as a **parameterised term query**, not concatenated into the search
+  engine's query DSL. Unbounded wildcard and regex syntax is not exposed; a user-supplied leading
+  wildcard is a cheap way to make an index scan the whole corpus, which makes it an availability bug
+  as well as an injection one.
+- `alt` text is treated exactly like body text.
+
+### 9.6 Personal data and what deletion actually removes
+
+`DELETE /v1/accounts/me` promises purge from every timeline within 24 hours. Precisely:
+
+| Data | On deletion | Where |
+|---|---|---|
+| Login, sessions | Blocked and revoked **immediately**, synchronously in the 202 | §5.2, §5.1 endpoint 9 |
+| Posts, revisions, search docs, images, follow edges, timeline entries | Physically removed within 24 h; **invisible within ~1 s** via the tombstone filter, which runs before hydration and does not depend on the purge finishing | §4.13, §8.6, §11.4 |
+| Post bodies in the event log (§4.5) | Not individually deletable — the log is append-only. Bounded by its 7-day retention, after which the segments age out | §4.5 |
+| Backups of the post store | Survive up to the 30-day backup retention. A restore replays the tombstone list before the restored data is served | §8.5 |
+| Request logs, metrics, traces | Not purged. They are aggregated or `sub`-hashed at write time and carry no post bodies; retention is 30 days (§10) | §1.3 |
+
+The two rows in the middle are the honest ones: **"purged from every timeline in 24 h" is a promise
+about the serving path, not about every byte on every disk.** Making it literal would require either
+key-per-user encryption with key destruction (crypto-shredding) or a log compaction pass that
+rewrites history, and I chose neither — recorded as a limitation in §13/§14 rather than glossed.
+
+A deleted author's posts return `404 post_not_found`, identical to a post that never existed (§5.1
+endpoint 3). That is deliberate: distinguishing "deleted" from "absent" leaks the fact of deletion.
+
+### 9.7 Transport
+
+TLS 1.3 only at the edge, HSTS with `preload` and a one-year `max-age`, no plaintext listener at all
+(port 80 redirects and serves nothing else). Presigned upload URLs and the image CDN are HTTPS-only;
+`Secure` is set on the refresh cookie, so it cannot downgrade. Inside the trust boundary, service-to-
+service calls use **mTLS with SPIFFE identities** — the fanout workers and purge workers can write
+timelines and delete rows, so an attacker with a foothold in any pod should not be able to speak to
+the timeline store simply by being on the network. Object-store and database credentials are
+short-lived, issued per workload, never in an image or environment file.
+
+### 9.8 What I am explicitly not defending against
+
+Named so the debrief does not have to find them: account takeover via a compromised email provider
+(no MFA is designed here — it belongs in the identity service that §5.2 treats as given);
+sophisticated distributed abuse below per-subject thresholds (§9.3); a malicious insider with
+production database access; and supply-chain compromise of the image-decoding dependency, which
+§9.4's sandbox contains but does not prevent.
 
 ---
 
