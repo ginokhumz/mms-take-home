@@ -1763,11 +1763,153 @@ production database access; and supply-chain compromise of the image-decoding de
 
 ## 10. Deployment and observability
 
-How the system is deployed and released. Then: the metrics that tell you it is healthy, the
-alerts you would page on, and the traces or logs you would need to debug the worked trace in
-section 12.
+### 10.1 Deployment shape
 
-Name the service level objective for the home timeline read and for search freshness.
+One region, three AZs (§1.3). Every component in §4 is a container on a scheduler, with three
+deployment *classes* that behave differently enough to be worth separating — most release incidents
+in a system like this come from treating class 2 and 3 like class 1:
+
+| Class | Components | Release mechanism | What makes it different |
+|---|---|---|---|
+| **Stateless request-path** | Gateway, post service, timeline service, follow service, account service | Rolling canary behind the load balancer | Instant rollback: shift traffic back. Blast radius is bounded by the canary fraction |
+| **Stateful consumers** | Fanout workers, search indexer, purge workers | Rolling restart, one partition group at a time | A restart is a consumer-group rebalance, which *pauses* the stream. Rollback does not undo work already written |
+| **Stores** | Post store, timeline store, search index, object store | Never in the same change as code; schema migrations are expand–contract | Not rollback-able by redeploy. The old code must tolerate the new schema and vice versa |
+
+**Canary for class 1.** 1% of traffic, 30-minute bake. At peak that is `17,361 × 1% ≈ 174 req/s`,
+so a 30-minute bake sees `174 × 1,800 ≈ 312,000 requests` — enough to detect an error-rate
+regression of a few tenths of a percent, which is the point of picking the duration from the traffic
+rather than from habit. Promotion is automatic if the canary's error rate and p99 stay inside the
+SLO; any breach rolls back without a human.
+
+**Rolling restarts for class 2 cost backlog, not errors.** A fanout consumer-group rebalance stalls
+the stream for ~30 s:
+
+```
+30 s × 86,806 entries/s peak            = 2,604,180 entries of backlog
+drain at the §8.1 surplus (313,000/s)   = 8.3 s to catch up
+```
+
+So a deploy is an 8-second lag spike, invisible against the 30 s alert threshold — *provided*
+deploys are serialised and not run during the peak band. Both are release policy, not code.
+
+**Schema changes are expand–contract, always in three releases:** add the new column/field and write
+both; backfill; switch reads; remove the old one in a later release. §6's stores make this cheap
+because every derived store is rebuildable from the event log (§8.0) — the search index and
+materialised timelines can be rebuilt rather than migrated, which is a deliberate property, not a
+happy accident.
+
+**Configuration that is not a deploy.** Three dials from earlier sections are runtime flags, changed
+without a release because they are the levers used *during* an incident: the wide/narrow follower
+threshold (§7.5), the timeline trim depth (§4.7), and the admission-shedding order (§9.3).
+
+### 10.2 The two SLOs the prompt asks for
+
+| SLO | Target | Measured how | Error budget |
+|---|---|---|---|
+| **Home timeline read** | **99.9% of `GET /v1/timeline/home` return 200 in < 400 ms, measured at the gateway over a 28-day window** | Server-side latency histogram at §4.1, excluding client network | `500,000,000 × 30 × 0.1% = 15,000,000 requests/month`, or **43.2 minutes** of total unavailability |
+| **Search freshness** | **p99 publish-to-searchable < 5 s** (the prompt's constraint, restated as an SLO) | A synthetic prober publishes a post every 10 s and polls `GET /v1/search` until it appears; `freshness_lag_ms` on every real response is the corroborating signal (§5.1, §7.4) | 1% of probes may exceed 5 s; two consecutive windows over budget freezes indexer deploys |
+
+400 ms is chosen against the §3.4 read path, not picked round: a cached page is one timeline-store
+slice plus one multi-get, tens of milliseconds; 400 ms is the budget that still holds when the merge
+path runs and a few posts miss the cache. `degraded: true` responses (§5.1) count as **successes**
+for availability and are tracked as a separate SLI — a degraded page is the design working, and an
+SLO that punishes graceful degradation teaches the system to fail hard instead.
+
+### 10.3 Metrics: the signals that say it is healthy
+
+Grouped by the §7 bottleneck they are the leading indicator for, because a metric that is not
+attached to a specific failure is a dashboard nobody reads.
+
+| Signal | Why it exists | Healthy | Source |
+|---|---|---|---|
+| `fanout_lag_seconds` p99 (outbox write → timeline entry) | #1 bottleneck (§7.2). The only thing that notices fanout is broken — publish still returns 201 (§8.1) | < 5 s | Consumer lag per partition + timestamp delta |
+| `timeline_entries_written_per_second` | Distinguishes "fanout is behind" from "fanout is saturated" — the 4.6× mean headroom is a fiction under a skewed follower mix (§7.2) | < 200,000/s | Fanout workers |
+| `post_cache_hit_ratio` | #2 (§7.3). 95% → 90% doubles post-store reads from 17.4k to 34.7k/s | > 92% | Post cache |
+| `search_freshness_p99_ms` | The SLO itself (§10.2) | < 5,000 | Synthetic prober |
+| `timeline_read_p99_ms`, `timeline_read_error_ratio` | The other SLO | < 400 ms, < 0.1% | Gateway |
+| `degraded_page_ratio` | Distinguishes a healthy-looking availability number from a system quietly serving half-pages | < 0.5% | Timeline service |
+| `merge_wide_followees_per_request` p99 | #4 (§7.5). Rises when the wide/narrow dial is turned down — the coupling between #1's fix and #4's load | < 10 | Timeline service |
+| `purge_age_hours` max | The 24 h promise (§11.4) | < 18 h | Purge workers |
+| `rate_limit_evaluations_per_second`, `limiter_fail_open_ratio` | §9.3 fails open by design; silent fail-open is an invisible loss of protection | fail-open = 0 | Gateway |
+| `media_rejected_ratio` by reason | §9.4. A spike in `magic_byte_mismatch` is an attack signal, not a bug | stable | Media service |
+
+Cardinality is kept deliberately low: no `user_id`, `post_id` or raw path in a metric label. Per-user
+questions are answered by traces and logs (§10.5), which is what they are for.
+
+### 10.4 Alerts: what pages, and what does not
+
+Paging is reserved for the two SLOs and for the promises that are *not* recoverable by waiting.
+
+| Page | Condition | Why a human |
+|---|---|---|
+| Timeline SLO burn | 2% of the 28-day budget in 1 h, **or** 5% in 6 h (multi-window burn rate) | A fast burn is an outage; the slow window catches a regression that would exhaust the budget mid-month |
+| Fanout lag | p99 > 30 s for 5 min | The §8.7 staleness bound is a published contract; past it, users see missing posts |
+| Search freshness | p99 > 5 s for 10 min | The prompt's constraint is broken |
+| Purge age | Oldest incomplete purge > 18 h | Six hours of margin to fix it inside the 24 h budget (§8.6) |
+| Timeline shard loss | Any shard unavailable > 1 min | Rebuild costs 34,722 reads/s against a 25,000/s budget (§8.4) — recovery is bigger than the failure and must be paced by a human |
+| Publish error ratio | > 1% for 5 min | The one operation with no read-side fallback |
+
+**Ticket, do not page:** cache hit ratio below 92%, CDN hit rate drop (a bill, §7.5), rising
+`merge_wide_followees`, media rejection spikes, a single fanout worker crash-looping while the group
+keeps up. Each of these is a thing to fix on Tuesday; paging on them is how the SLO alerts get
+ignored.
+
+**Deliberately not an alert:** CPU, memory and disk on the service tier. Every one of them is either
+already captured by a signal above or is the autoscaler's job — §7.2 makes the point that the useful
+fanout alert is lag, not CPU, because a healthy-CPU worker pool can still be 26 million entries
+behind.
+
+### 10.5 Tracing and logging: debugging the §12 trace specifically
+
+§12 is one post by a 3M-follower author, edited at minute 10, read by a follower who is part-way
+through pagination. If a user reports "I saw the old text on page 3", these are the artefacts that
+settle it — and this is the requirement that shapes the instrumentation:
+
+1. **`X-Request-Id` on every response**, echoed in the error envelope (§5.5) and rendered in the UI.
+   That is the only identifier a user can read off their screen, so it is the entry point.
+2. **One trace per request**, W3C `traceparent` propagated from the gateway through timeline service
+   → timeline store → post cache → post store, with the **post IDs returned and the revision of each
+   hydrated post as span attributes**. This is the span that answers "which revision did page 3
+   actually serve?" — without the revision attribute the trace proves nothing about the complaint.
+3. **The cursor, decoded, as a span attribute** on each timeline read. Three reads with cursors
+   `b=…890`, `…870`, `…850` reconstruct the pagination session and prove no post was skipped or
+   repeated (§5.3).
+4. **An edit audit record** per revision — `post_id`, `author_id`, `revision`, `edited_at`, source IP,
+   `request_id` — stored with the revision row (§6.3), not just logged. It is user-visible history,
+   so it is data, and it gives the exact wall-clock instant to compare page reads against.
+5. **A cache-invalidation log line** on every `DEL post:{id}`, with the timestamp. The whole
+   correctness argument for edit propagation (§11.2) is "the delete happens before the write is
+   acknowledged"; if a stale body is ever served, this line is the first thing to check.
+6. **Fanout worker logs keyed by `post_id`**, so a missing timeline entry can be traced to a
+   partition, an offset and a worker.
+
+With those six, the §12 question — did the follower see the post twice, zero times, or in two
+versions — is answered from telemetry rather than from reasoning about the design.
+
+**Sampling and volume**, because "trace everything" is not free at 17,361 req/s:
+
+```
+head sampling 1% of ~620M requests/day = 6.2M traces/day × ~2 KB = 12.4 GB/day
+plus tail-based: 100% of errors, 100% of p99-exceeding requests, 100% of PATCH and DELETE
+structured request logs ~400 B × ~670M/day ≈ 268 GB/day → 8 TB at 30-day retention
+```
+
+`PATCH`, `DELETE /v1/accounts/me` and publish are always sampled at 100% because they are rare
+(edits are ~5% of posts, §6) and they are the operations whose disputes are expensive.
+
+**Retention and privacy.** Request logs, traces and metrics are kept **30 days**, matching §9.6.
+They carry `sub` as a salted hash, never a post body and never an image, so a deleted account leaves
+no readable personal data behind in telemetry — which is exactly why §9.6 can say logs are
+anonymised rather than purged without that being a dodge. The event log's 7-day retention (§4.5,
+§8.0) is a separate number and does contain bodies; it is the one place the deletion promise leans on
+expiry rather than on a delete.
+
+### 10.6 What I have not designed here
+
+No multi-region failover story, because §1.3 assumes one region. No load-shedding *implementation*
+for the admission controller §9.3 relies on. No on-call rotation, runbook set or incident process —
+real operability is mostly those, and a design document that claims them without writing them is
+claiming something it has not done.
 
 ---
 
