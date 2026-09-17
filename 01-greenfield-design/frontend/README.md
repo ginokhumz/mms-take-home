@@ -57,6 +57,15 @@ evidence that it satisfies a fixture written by the same hand, at the same time,
 separate arrays, which is what makes the publish-versus-pagination race resolvable by reading one
 file. A composable would work; a single named owner is easier to inspect and easier to explain.
 
+**One counter decides which responses are allowed to write.** Every fetch that replaces or extends
+the list takes an epoch on entry and re-checks it before writing. That is what makes a restart
+landing on top of an in-flight "load more" safe, and what stops two first-page loads from a
+double-clicked "Try again" resolving out of order and leaving the store rendering one page while
+paginating from another page's cursor. A counter rather than an `AbortController`: the request was
+often worth finishing, and the only question is whether its result is still current. Publishing
+deliberately does not take an epoch — it writes to the head while pagination writes to the tail, so
+the two never contend.
+
 **Wire names stay snake_case all the way to the template.** `api/types.ts` is the only place a
 field name appears as a literal, so a contract that gains or renames a field breaks at compile time
 in one file rather than at runtime in five. The single exception is the error object, where
@@ -69,10 +78,10 @@ in one file rather than at runtime in five. The single exception is the error ob
 | Module | Contract section |
 |---|---|
 | `src/api/types.ts` | §5.0 shared objects (`Post`, `Author`, `PostImage`); the §5.1 endpoint 2 page envelope; the §5.1 endpoint 5 revisions body; the endpoint 1 and 4 request bodies |
-| `src/api/errors.ts` | §5.5 error model: `code`, `message`, `retryable`, `request_id`, `details`, and the rule that only 429 and 503 drive an automatic retry |
+| `src/api/errors.ts` | §5.5 error model: `code`, `message`, `retryable`, `request_id`, `details`, the rule that only 429 and 503 drive an automatic retry, and the four named 503 dependency codes |
 | `src/api/http.ts` | §5.2 bearer token; §5.4 `Idempotency-Key`; §5.1 endpoint 4 `If-Match`; §5.5 backoff honouring `Retry-After` |
-| `src/api/client.ts` | §5.1 endpoints 1, 2, 4 and 5; asserts the §5.1 endpoint 2 invariant that `next_cursor` is null exactly when `has_more` is false |
-| `src/stores/timeline.ts` | §5.3 cursor pagination; §5.4 optimistic publish and idempotent replay |
+| `src/api/client.ts` | §5.1 endpoints 1, 2, 4 and 5; asserts the §5.1 endpoint 2 invariant that `next_cursor` is null exactly when `has_more` is false; names each call's §5.5 503 code |
+| `src/stores/timeline.ts` | §5.3 cursor pagination; §5.4 optimistic publish and idempotent replay; §5.1 endpoint 2 `degraded` |
 | `src/components/TimelineView.vue` | §5.1 endpoint 2: loading, empty, error and end-of-list states |
 | `src/components/ComposeBox.vue` | §5.1 endpoint 1, including its 1–500 code-point counting rule after NFC normalisation |
 | `src/components/EditBox.vue` | §5.1 endpoint 4: the window, `If-Match`, and `edit_window_closed` as terminal |
@@ -151,9 +160,10 @@ without editing code.
 ## What I cut
 
 - **No component or browser tests.** Vitest covers the store and the error parser: pagination
-  edges, both halves of rollback, the publish/load-more race in both resolution orders, idempotent
-  replay, and error parsing including a non-contract-shaped body. Rendering is verified by hand.
-  21 tests.
+  edges, both halves of rollback, the publish/load-more race in both resolution orders, a restart
+  landing on top of an in-flight "load more", two first-page loads resolving out of order,
+  idempotent replay, and error parsing including a non-contract-shaped body. Rendering is verified
+  by hand. 24 tests.
 - **No image upload, no auth UI, no real backend** — all out of scope. The publish request body is
   text only, so the contract's optional `media_id` and `alt` are unused.
 - **No silent token refresh**, although the contract defines one on `token_expired`. It overlaps

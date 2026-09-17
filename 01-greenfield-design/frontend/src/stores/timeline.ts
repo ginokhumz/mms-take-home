@@ -29,7 +29,27 @@ export const useTimelineStore = defineStore('timeline', () => {
   const pending = ref<PendingPost[]>([]); // optimistic only; never mixed into items
   const cursor = ref<string | null>(null);
   const hasMore = ref(false);
+  /**
+   * Describes the list currently on screen, not the last page fetched. The server sets the flag
+   * per page, but the reader is looking at every page at once: clearing it because page 2 came
+   * back healthy would retract a warning about page 1 while page 1 is still rendered. It resets
+   * only when the list itself is replaced, which is the one moment the warning stops applying.
+   */
   const degraded = ref(false);
+  /**
+   * Bumped by every fetch that replaces or extends `items`, and checked again before that fetch
+   * writes anything. A response whose epoch has moved on belongs to a list the user has already
+   * discarded, so it is dropped rather than merged.
+   *
+   * `loadMore` is additionally guarded by `canLoadMore`, but that only stops two "load more"
+   * calls overlapping. It does not stop a restart landing on top of one, or two first-page loads
+   * from an impatient double-click on "Try again" — where the slower response wins and leaves the
+   * store holding a cursor that does not belong to the rendered list.
+   *
+   * A counter rather than an AbortController on purpose: the request may well have been worth
+   * completing, and the question here is only whether its result is still allowed to be written.
+   */
+  const epoch = ref(0);
   /** First-page failure: replaces the list. Only ever set while items is empty. */
   const error = ref<ApiError | null>(null);
   /**
@@ -52,17 +72,21 @@ export const useTimelineStore = defineStore('timeline', () => {
   );
 
   async function loadFirstPage(): Promise<void> {
+    const mine = ++epoch.value;
     status.value = 'loading-first';
     error.value = null;
     loadMoreError.value = null;
     try {
       const page = await getHomeTimeline({ limit: PAGE_LIMIT });
+      if (mine !== epoch.value) return;
       items.value = page.items;
       cursor.value = page.page.next_cursor;
       hasMore.value = page.page.has_more;
+      // A fresh first page replaces the whole list, so this is the assignment that resets the flag.
       degraded.value = page.degraded;
       status.value = 'ready';
     } catch (e) {
+      if (mine !== epoch.value) return;
       error.value = asApiError(e);
       items.value = [];
       status.value = 'error';
@@ -72,27 +96,36 @@ export const useTimelineStore = defineStore('timeline', () => {
   async function loadMore(): Promise<void> {
     if (!canLoadMore.value) return;
     const from = cursor.value;
+    const mine = ++epoch.value;
     status.value = 'loading-more';
     loadMoreError.value = null;
     try {
       const page = await getHomeTimeline({ limit: PAGE_LIMIT, cursor: from });
+      if (mine !== epoch.value) return;
       // Pagination is forward-only over descending IDs, so this is append-only. A post already
       // returned has an ID at or above the cursor and cannot come back on a later page.
       items.value = items.value.concat(page.items);
       cursor.value = page.page.next_cursor;
       hasMore.value = page.page.has_more;
-      degraded.value = page.degraded;
+      // Sticky while the list grows: a degraded page stays degraded once it is on screen.
+      degraded.value = degraded.value || page.degraded;
     } catch (e) {
+      if (mine !== epoch.value) return;
       // The cursor is NOT cleared: on a retryable failure the same cursor is still correct.
       loadMoreError.value = asApiError(e);
     } finally {
-      status.value = 'ready';
+      // Only if this response is still the current one — a superseded page must not drop the
+      // store out of the 'loading-first' state the request that replaced it just set.
+      if (mine === epoch.value) status.value = 'ready';
     }
   }
 
   /**
    * A rejected cursor is terminal — the client starts again at page 1, which is a different action
    * from retrying the request that failed, and the UI offers it as a different button.
+   *
+   * loadFirstPage bumps the epoch on entry, so a "load more" still in flight when this runs is
+   * invalidated and cannot append its page to a list that has just been thrown away.
    */
   async function restart(): Promise<void> {
     items.value = [];

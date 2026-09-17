@@ -155,6 +155,73 @@ describe('timeline store — pagination', () => {
     expect(vi.mocked(client.getHomeTimeline)).toHaveBeenCalledTimes(2);
     expect(s.items.map((p) => p.id)).toEqual(['300', '200']);
   });
+
+  it('discards an in-flight load more when the list is restarted underneath it', async () => {
+    vi.mocked(client.getHomeTimeline).mockResolvedValueOnce(page(['300', '200'], 'cur-200'));
+    const s = useTimelineStore();
+    await s.loadFirstPage();
+
+    let releaseMore: ((p: TimelinePage) => void) | undefined;
+    vi.mocked(client.getHomeTimeline).mockReturnValueOnce(
+      new Promise((r) => {
+        releaseMore = r;
+      }),
+    );
+    const more = s.loadMore();
+
+    vi.mocked(client.getHomeTimeline).mockResolvedValueOnce(page(['500', '400'], 'cur-400'));
+    await s.restart();
+
+    // The stale page arrives last and must not be appended: those rows belong to a list the
+    // restart threw away, and concatenating them would show posts from two different reads.
+    releaseMore?.(page(['100'], null));
+    await more;
+
+    expect(s.items.map((p) => p.id)).toEqual(['500', '400']);
+    expect(s.cursor).toBe('cur-400');
+    expect(s.hasMore).toBe(true);
+    expect(s.status).toBe('ready');
+  });
+
+  it('two first-page loads resolving out of order: the later request wins', async () => {
+    let releaseSlow: ((p: TimelinePage) => void) | undefined;
+    vi.mocked(client.getHomeTimeline).mockReturnValueOnce(
+      new Promise((r) => {
+        releaseSlow = r;
+      }),
+    );
+    const s = useTimelineStore();
+    const slow = s.loadFirstPage();
+
+    vi.mocked(client.getHomeTimeline).mockResolvedValueOnce(page(['500'], 'cur-500'));
+    await s.loadFirstPage();
+
+    releaseSlow?.(page(['300', '200'], 'cur-200'));
+    await slow;
+
+    // Without the epoch check the slower response would win by arriving last, leaving the store
+    // rendering one list and paginating from the other list's cursor.
+    expect(s.items.map((p) => p.id)).toEqual(['500']);
+    expect(s.cursor).toBe('cur-500');
+  });
+
+  it('the degraded flag is sticky across pages and resets only when the list is replaced', async () => {
+    const degradedPage: TimelinePage = { ...page(['300'], 'cur-300'), degraded: true };
+    vi.mocked(client.getHomeTimeline)
+      .mockResolvedValueOnce(degradedPage)
+      .mockResolvedValueOnce(page(['200'], null));
+    const s = useTimelineStore();
+    await s.loadFirstPage();
+    expect(s.degraded).toBe(true);
+
+    // Page 2 is healthy, but the incomplete page 1 is still on screen, so the warning stands.
+    await s.loadMore();
+    expect(s.degraded).toBe(true);
+
+    vi.mocked(client.getHomeTimeline).mockResolvedValueOnce(page(['400', '300'], null));
+    await s.restart();
+    expect(s.degraded).toBe(false);
+  });
 });
 
 describe('timeline store — optimistic publish', () => {
