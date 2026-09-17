@@ -1,0 +1,17 @@
+/* Plain and legible. SPEC.md puts styling polish out of scope and does not mark visual design. */
+:root {
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  line-height: 1.5;
+  color: #14171a;
+  background: #fff;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  max-width: 40rem;
+  margin: 0 auto;
+  padding: 1rem;
+}
