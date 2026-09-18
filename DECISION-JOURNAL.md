@@ -15,15 +15,13 @@ Delete these instructions and the example entry before you submit, or leave them
 
 ## Time log
 
-Fill this in at the end. Wall-clock hours, honestly.
-
-| Piece | Hours |
-|-------|-------|
-| Problem 1, design document | |
-| Problem 1b, frontend | |
-| Problem 2, critique and extend | |
-| Journal and admin | |
-| **Total** | |
+| Piece | Hours | Guide |
+|-------|-------|-------|
+| Problem 1, design document | **6.0** | ~5 h — **over by 1** |
+| Problem 1b, frontend | **2.0** | 3–4 h — under |
+| Problem 2, critique and extend | **1.6** | ~4 h — well under |
+| Journal and admin | **2.2** | ongoing |
+| **Total** | **11.8** | ~11–12 h |
 
 ---
 
@@ -102,9 +100,44 @@ made you move.
 List the approaches you tried and abandoned. We read this section closely. An empty section is a
 weaker signal than a full one.
 
+Reconstructed by walking the git history and this journal. Nothing here was reverted as a commit —
+there are no reverts and no deleted files in the repo — because every one of these died inside a
+document or a plan before it reached a commit, or was written and cut in the same session. Where a
+row says "written then removed", the string is still findable in `git log -S` and absent from
+`HEAD`.
+
+The five reversed decisions in *Changes of mind* above are deliberately not repeated here.
+
+**Problem 1 — the design document**
+
 | Approach | Why I abandoned it |
 |----------|--------------------|
-| | |
+| A `lang` field on the post row, carried in the `posts` table, the row-size sum and the search document | Written then removed. It had no source and no consumer — never in the §5 contract, nothing producing it, nothing reading it. It would have been a §5/§6 inconsistency I could not have defended, and language-aware search is not in scope. Removing it moved the post row from 230 B to 222 B and forced a redo of every sum it fed |
+| Justifying the 12.4:1 read ratio with "public social feeds are often quoted at 100:1 or higher" | Written then deleted, and it is the mistake I am least comfortable with, because it violated the prompt's explicit instruction not to substitute figures from another system — and it was doing real argumentative work, not decorating. Replaced with an argument from scope: §1.2 puts logged-out reading out of scope, so every read counted is authenticated, and I decline to put a number on anonymous traffic because the constraint table gives me nothing to derive one from |
+| Modelling three "plausible follower mixes" in §7.2 to argue that the mean-based 4.6× fanout headroom was a fiction | The analysis was wrong, not just imprecise. Aggregate fanout is `posts/s × mean` **identically**, so a distribution changes how work arrives but never how much there is — and my three mixes implied mean fanouts of 110–170 against the constraint's 50. I verified this by constructing two mixes consistent with mean 50 and getting 86,800 entries/s from both. The replacement insight is the opposite one: the mean fixes the throughput, the tail fixes the queueing. §7.2 carries the retraction in the text rather than a silently corrected number |
+| A counter row holding `active_bucket` for the follower-list bucketing | It cannot work. A Cassandra counter cannot serve as a checked pointer — you cannot read-modify-write it conditionally — so it could not do the one job it was there for. Replaced with `users.active_bucket` plus a `bucket_fill` table advanced by a lightweight transaction |
+| Having an agent verify the frontend in a headless browser | Offered and declined. The debrief asks me to walk through this code and its behaviour from memory, and "an agent ticked the checklist" is not an answer I could give out loud. I took the state walkthrough myself |
+
+**Problem 1b — the frontend**
+
+| Approach | Why I abandoned it |
+|----------|--------------------|
+| A `/v1/me` endpoint to supply the viewer identity | Inventing an endpoint that is not in the contract is exactly the drift this section is marked on. Hardcoded the viewer as a constant shared by the mock and the client instead |
+| An in-process fixture layer instead of a mock HTTP server | Rejected at planning. Real HTTP gives real status codes, a real `ETag`, a real `Retry-After` and a genuine `?fault=` query parameter; a fixture layer would have made the error path a code branch, which is far weaker evidence that the client actually matches the contract |
+| A single store-level `publishError` slot | Written into the plan, then removed before any code. `pending` is an array, so one shared slot means composing a second post silently wipes the error on a first entry still sitting there with a "Try again" button. Retryable errors moved onto `PendingPost.error`; two regression tests fail on the old shape |
+| An `AbortController` to fence in-flight timeline loads | The request is usually worth finishing — the only question is whether its result is still current. An epoch counter answers exactly that question and nothing else, and it does not throw work away that has already been paid for |
+| Silent token refresh in the client | Out of scope: it overlaps the auth UI the brief excludes |
+
+**Problem 2 — critique and extend**
+
+| Approach | Why I abandoned it |
+|----------|--------------------|
+| A partial unique index (`WHERE created_at >= '<cutoff>'`) to get a uniqueness guarantee in place before remediating duplicates | It builds successfully despite the ~18,400 historical duplicates, which is what makes it tempting. But it only catches new-vs-new collisions — a new link colliding with one of the 120M pre-cutoff rows is not in the index and passes straight through, and that is where essentially all the collision probability lives. Small fraction of the protection, real complexity in every `ON CONFLICT` clause. Written up in A.1.2 as considered-and-rejected rather than dropped silently |
+| Declarative range partitioning on `expires_at`, with expiry as `DROP TABLE` on a partition | The textbook answer, and mutually exclusive with the fix for the highest-ranked entry in my own register: Postgres requires the partition key in every unique constraint, so partitioning makes `UNIQUE (shortlink)` impossible. Recovering it needs a separate registry table — a second write on create, a second lookup on read — to optimise 33 MB/day of expiry I/O. It is the rejected alternative in B.7.5 |
+| Two more register entries: no `Cache-Control` header, and indefinite analytics log retention | Drafted, then cut to keep the register at seven well-evidenced entries rather than nine uneven ones. Cache-control does more work as a compounding factor inside the not-found entry than as a thin entry of its own. Log retention is genuine but had the weakest arithmetic in the set, and it is named in B.9 as something accounts make worse rather than better |
+| A register entry on the object-store round trip for 1 KB payloads | Dropped because it contradicted the A.4 I chose. I could not simultaneously criticise the body/metadata split and defend it as the thing a naive redesign would break |
+| Letting users claim their existing anonymous snippets, by link or by a creation-time token | The only possible proof of ownership is knowing the link, and A.1.1 establishes links are guessable in ~86.4M candidate milliseconds — so a claim flow is an ownership-transfer primitive driven by an enumeration attack. The token variant fails differently: it answers nothing about the 360M snippets that pre-date any token, which is the question actually being asked |
+| Per-viewer cache keys for private snippets, and separately, not caching private bodies at all | Per-viewer keys multiply entries by the sharing fan-out (6M × 4 = 24M) to prevent something the in-process check already prevents. Refusing to cache private bodies looks safer and is worse: it creates a timing side channel where a private snippet always misses the cache, so latency alone separates "private" from "does not exist" — reopening the enumeration oracle that returning 404 instead of 403 was meant to close |
 
 ---
 
