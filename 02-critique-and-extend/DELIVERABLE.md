@@ -41,14 +41,24 @@ Ranked most important first. The ranking criterion is stated in A.2.
   thousands of times at this volume, and because §5 declares no unique constraint on `shortlink`,
   a collision silently overwrites a stranger's snippet instead of failing.
 
-- **Evidence:** The identifier space is 62⁷ = 3,521,614,606,208. §3 gives 360 million links over
-  three years, so by the end of year three the probability that a new insert lands on an existing
-  link is 3.6 × 10⁸ ÷ 3.52 × 10¹² ≈ **1 in 9,782**. At 10 million writes in month 36 that is
-  10,000,000 ÷ 9,782 ≈ **1,022 collisions in that month alone**. Summed over the whole 360 million
-  inserts, the expected number of collisions is N²/2S = (3.6 × 10⁸)² ÷ (2 × 3.52 × 10¹²) ≈
-  **18,400 collisions to date**. §5 has no collision handling, and the DDL declares
-  `shortlink CHAR(7) NOT NULL` with the only index on `created_at` — so nothing rejects the
-  duplicate.
+- **Evidence:** The identifier space is 62⁷ = 3,521,614,606,208. The figure that matters is not how
+  many links have ever been issued but how many are **occupied at the moment of the insert**, and
+  §7 deletes both the row and the object on expiry — so the occupancy is A.0's **120 million live
+  rows**, not the 360 million created over three years. A collision against a link that has already
+  expired destroys nothing, because there is nothing left at that key.
+
+  So the probability that a new insert lands on a live link is 1.2 × 10⁸ ÷ 3.52 × 10¹² ≈
+  **1 in 29,347**. At 10 million writes in month 36 that is 10,000,000 ÷ 29,347 ≈ **341 collisions
+  in that month alone**. Summed across all 360 million inserts at that steady-state occupancy, the
+  expected number of collisions to date is 3.6 × 10⁸ × (1.2 × 10⁸ ÷ 3.52 × 10¹²) ≈ **12,267**.
+
+  How many of those are still *visible* as duplicate rows is a smaller and unknowable number — a
+  pair only survives while both rows are live — so the remediation in A.1.2 has to work from the
+  count the table actually yields rather than from this estimate. What the estimate establishes is
+  the order of magnitude: thousands, not a handful.
+
+  §5 has no collision handling, and the DDL declares `shortlink CHAR(7) NOT NULL` with the only
+  index on `created_at` — so nothing rejects the duplicate.
 
   The ordering of §5 makes it worse. Step 3 writes the object to `snippets/<shortlink>` *before*
   step 4 inserts the row. On a collision the object store `PUT` overwrites the earlier author's
@@ -72,7 +82,7 @@ Ranked most important first. The ranking criterion is stated in A.2.
 - **Severity: high**, because it is silent, unrecoverable and already happening. The other entries
   in this register describe cost, latency or downtime — things that are visible and reversible once
   noticed. This one has been quietly destroying user data for three years and has produced no
-  signal that would make anyone look. An estimated 18,400 snippets are already lost and there is no
+  signal that would make anyone look. An estimated 12,267 snippets have already been overwritten this way and there is no
   audit trail from which to identify them.
 
 - **Fix:** Two application changes, which are steps 2 and 4 of the four-step sequence set out in
@@ -81,8 +91,8 @@ Ranked most important first. The ranking criterion is stated in A.2.
 
   1. **Replace the generator** with `base62(CSPRNG(48 bits))`, giving 8 characters.
      `secrets.token_bytes` or equivalent — not a hash of request metadata. 62⁸ = 2.18 × 10¹⁴ drops
-     the per-insert collision probability at 360M links from 1 in 9,782 to **1 in 606,000**, a
-     factor of 62 improvement, and makes links unguessable rather than merely long. Keep reading
+     the per-insert collision probability against 120M live links from 1 in 29,347 to **1 in
+     1,819,501**, a factor of 62 improvement, and makes links unguessable rather than merely long. Keep reading
      7-character links forever; only mint 8-character ones.
 
      **Why 8 characters and not 7**, given that a CSPRNG at 7 characters already fixes the
@@ -102,7 +112,7 @@ Ranked most important first. The ranking criterion is stated in A.2.
 
      This is the change that actually stops collisions, and it is worth being clear that it does so
      **without depending on the unique constraint at all**. The constraint is a guardrail that
-     catches the 1 in 606,000; the generator is what makes the rate 1 in 606,000 in the first
+     catches the 1 in 1,819,501; the generator is what makes the rate 1 in 1,819,501 in the first
      place. That is why it goes in second in the sequence rather than waiting for the constraint,
      which cannot be declared until the historical duplicates are gone.
 
@@ -171,8 +181,8 @@ Ranked most important first. The ranking criterion is stated in A.2.
   **Why the constraint cannot be step 1.** The obvious move is to build the unique index
   immediately and get both fixes for one table rebuild. It does not work.
   `CREATE UNIQUE INDEX CONCURRENTLY` aborts as soon as it encounters the second copy of a key, and
-  by the arithmetic in A.1.1 there are an estimated **18,400 duplicate `shortlink` values already
-  in the table**. It does not warn or build a degraded index; the build fails and leaves an
+  by the arithmetic in A.1.1 there have been an estimated **12,267 collisions**, so duplicate
+  `shortlink` values are present in the table in the thousands. It does not warn or build a degraded index; the build fails and leaves an
   `INVALID` index to clean up. Nor is there an escape hatch: Postgres supports `NOT VALID` for
   check and foreign-key constraints, so they can be enforced going forward and validated later, but
   **not for unique constraints**. Uniqueness can only be declared over a corpus that is already
@@ -192,7 +202,7 @@ Ranked most important first. The ranking criterion is stated in A.2.
   2. **Deploy the A.1.1 generator change** (8 characters from a CSPRNG) and the write-order
      reversal. This drops the collision rate by a factor of 62 on its own, with no dependency on
      the constraint, and it stops the duplicate set growing while step 3 runs. Without it, step 3
-     is remediating a set that is still being added to at ~1,022 rows a month.
+     is remediating a set that is still being added to at ~341 rows a month.
 
   3. **Remediate the existing duplicates.** `SELECT shortlink FROM snippets GROUP BY shortlink
      HAVING count(*) > 1;` — an index-only scan now, rather than a 12 GB scan plus a sort, which is
@@ -216,7 +226,7 @@ Ranked most important first. The ranking criterion is stated in A.2.
      retry in the write path, which has something to conflict against for the first time.
 
      Step 4 is the guardrail, not the cure. After step 2 the expected collision rate is about
-     **17 per month** across the whole service rather than 1,022; this step is what turns those 17
+     **5.5 per month** across the whole service rather than 341; this step is what turns those few
      from silent data destruction into a retry nobody notices.
 
   **One option I considered and rejected**, because it looks like a way to get the constraint into
@@ -341,8 +351,16 @@ Ranked most important first. The ranking criterion is stated in A.2.
     reads that currently all reach origin.
   - Fix the read-after-write race explicitly rather than relying on the status code to explain it:
     on a replica miss, retry the lookup once against the primary before concluding the snippet does
-    not exist. At 4 writes/s this costs the primary a negligible number of point lookups, and it
-    removes the only case where a correct `404` would still be the wrong answer.
+    not exist. **Bound that retry** — this is the part that is easy to get wrong. The retry fires on
+    every read that finds *no row*, not on every write, so the population driving it is not the
+    4 writes/s but bogus links, expired links, crawlers and — once A.1.1's fix makes links worth
+    enumerating — scanners. Left unbounded, every guess a scanner makes becomes a point lookup on
+    the single SQL primary that A.1.7 identifies as the write path's one point of failure with
+    manual promotion: the fix for this entry would become an amplification path into the failure
+    mode of that one. Restrict the primary fallback to reads that can plausibly be racing a write —
+    only when the request carries a create-time token, or arrives within the measured
+    replication-lag window — and put a global ceiling on primary fallbacks per second, shedding to
+    the plain `404` above it.
   - Alert on the `404` and `410` rates as a proportion of reads, which is only possible once the
     first change is made.
 
@@ -486,7 +504,7 @@ does, can it be undone afterwards? That criterion puts silent data destruction a
 because an outage ends and a lost snippet does not.
 
 That produces the top of the list. **A.1.1** is the only entry where the damage is permanent — an
-estimated 18,400 snippets have already been overwritten, roughly 1,022 more will be this month, and
+estimated 12,267 snippets have already been overwritten, roughly 341 more will be this month, and
 there is no log, no account and no backup path by which any of them could be identified or
 restored. Everything else in the register is recoverable by deploying a fix. **A.1.2** follows
 because although an index is the cheapest fix in the document, the failure it produces is
@@ -717,13 +735,22 @@ CREATE TABLE users (
 );
 ```
 
-Passwords are hashed with **Argon2id** at `m = 64 MiB, t = 3, p = 1`, which is the OWASP baseline
-and costs roughly 50 ms per verify. That cost is often the objection to a memory-hard hash, so it
-is worth pricing against this system's actual traffic rather than against a general worry: at §3's
-10 million writes/month, even assuming logins run at 10% of write volume, that is 0.39 logins/s at
-the stated 10× peak, and 0.39 × 50 ms = **0.019 of a CPU core**. The memory is the real cost —
-64 MiB × the concurrency — and at this rate the concurrency is under one. There is no argument for
-a weaker hash here.
+Passwords are hashed with **Argon2id** at `m = 64 MiB, t = 3, p = 1`. OWASP's floor for Argon2id is
+a set of equivalent-cost pairs — `m = 47 MiB, t = 1`; `m = 19 MiB, t = 2`; `m = 12 MiB, t = 3` — all
+at `p = 1`. The parameters above are deliberately **above** that floor, roughly 5× the memory of
+OWASP's `t = 3` entry, and the justification is the traffic arithmetic below rather than a standard.
+
+The ~50 ms per verify that memory-hard hashing costs is the usual objection, so it is worth pricing
+against this system rather than against a general worry. §3 gives 10 million writes/month =
+3.86 writes/s. Assuming logins run at 10% of write volume, that is **0.39 logins/s average and
+3.86/s at the stated 10× peak**. At 50 ms each, the peak cost is 3.86 × 0.05 = **0.19 of a CPU
+core**. The memory is the more interesting number — 64 MiB × the concurrency — and a concurrency of
+0.19 means about 12 MiB resident on average, with headroom for a burst of simultaneous logins
+measured in hundreds of megabytes rather than gigabytes.
+
+So the generous parameters cost a fifth of a core at peak. There is no argument for a weaker hash
+here, and the reason is that this service's login rate is tiny relative to its read traffic — not
+that Argon2id is cheap.
 
 Email verification is required before an account can hold private snippets, but **not** before it
 can log in and own public ones, so the friction sits in front of the feature that needs identity
@@ -795,6 +822,8 @@ snippet is unlisted in practice. Adding the word without adding behaviour would 
 nothing behind it.
 
 ```sql
+-- Shown as the end state. On the live table the column and the foreign key are added
+-- separately, and the FK as NOT VALID then VALIDATE -- see B.8 step 7 for why.
 ALTER TABLE snippets ADD COLUMN owner_id   BIGINT NULL REFERENCES users(user_id);
 ALTER TABLE snippets ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public';
 
@@ -941,7 +970,7 @@ These are chosen against §3's figures rather than picked as round numbers:
 **Rate limiting does not replace the size cap from A.1.6**, and it is worth doing the arithmetic
 rather than assuming it does. Ten writes/hour of unbounded size is still unbounded. With A.1.6's
 512 KB cap, one capped IP can write 240 × 512 KB = **123 MB/day** — a thousand such IPs is 123 GB/day,
-which is a bill worth watching but is four orders of magnitude below A.1.6's 86.4 TB/day. The two
+which is a bill worth watching but is **roughly 700× below** A.1.6's 86.4 TB/day. The two
 controls multiply; neither alone is sufficient.
 
 ### What a limited client receives
@@ -1178,7 +1207,16 @@ The `INCLUDE` is the whole trick and it is the specific failure of §7's existin
 `idx_snippets_created_at` "supports the ordering", but the query selects `shortlink` and
 `object_key`, which that index does not contain, so every row needs a heap fetch and the planner
 sensibly prefers a sequential scan. Carrying both payload columns in the index leaf makes the
-expiry query **index-only** — it never touches the heap at all.
+expiry query **index-only**: the rows it needs are all in the index leaf.
+
+An index-only scan is not a guarantee of zero heap access, and the caveat matters here rather than
+being pedantry. Postgres still consults the visibility map, and falls back to a heap fetch for any
+page not marked all-visible. This table takes constant inserts at 3.9/s *and* ~13,889 deletes/hour
+from this very job, so the recently-touched pages the expiry query targets are precisely the ones
+least likely to be all-visible. The 1.39 MB figure below therefore holds **only while autovacuum
+keeps the visibility map current**; if it falls behind, the scan degrades to an index scan plus heap
+fetches and the advantage narrows. Autovacuum settings for this table are part of the change, not
+an afterthought, and visibility-map staleness is the thing to alert on.
 
 ### The query
 
@@ -1197,16 +1235,21 @@ The arithmetic against §3's figures: at steady state **13,889 rows expire per h
 scan, against §7's current **12 GB** full scan — a factor of **8,640**, which is precisely the
 scanned-to-deleted ratio A.1.3 identified. Daily I/O falls from 288 GB to about 33 MB.
 
-`LIMIT 5000` bounds each transaction rather than the total work: **2.8 batches per hourly run**, or
-fewer per run once the job runs more often. The bound exists so that a backlog — after an outage, or
+`LIMIT 5000` bounds each transaction rather than the total work. At the 5-minute cadence below,
+each run finds ~1,157 expired rows, so **`LIMIT 5000` never binds at steady state** — it exists
+entirely for the abnormal case. The bound exists so that a backlog — after an outage, or
 on the first run after deployment — is drained in short transactions instead of one enormous one
 that holds a snapshot open and bloats the table.
 
 ### The job shape
 
 Every **5 minutes**, not hourly. §7 accepts up to an hour of post-expiry readability as the price of
-the scan; once the scan costs 1.39 MB there is nothing left to buy with that hour. Twelve runs an
-hour is ~17 MB/hour of index reads, and the user-visible staleness drops from 60 minutes to 5.
+the scan; once an hour's worth of expiry costs 1.39 MB there is nothing left to buy with that hour.
+
+Running more often does **not** cost more: the work is set by the number of rows that have expired,
+not by how often you look. Twelve runs an hour each find ~1,157 rows and read ~0.12 MB, so the total
+is the same **1.39 MB/hour** — about **33 MB/day** — as a single hourly run. The only thing that
+changes is that user-visible staleness drops from 60 minutes to 5.
 
 Per batch, in this order, which is chosen so that every possible crash point leaves a recoverable
 state:
@@ -1274,10 +1317,10 @@ the calculation changes and the registry table starts to earn its cost. At §3's
 > **Alternative rejected:** Stateless JWTs with a short expiry and a refresh token, plus a
 > claim-by-link flow so early users could adopt their existing snippets.
 >
-> **The numbers that forced it:** Argon2id at the OWASP baseline costs ~50 ms per verify; at §3's
-> 10M writes/month, logins at 10% of that volume are 0.39/s at the stated 10× peak, so the hash
-> costs **0.019 of a CPU core** — the usual reason to reach for something weaker does not exist
-> here. Sessions are **10,000 concurrent × 200 B = 2 MB**, against a cache already sized for
+> **The numbers that forced it:** Argon2id at `m = 64 MiB, t = 3` — above OWASP's floor, not at it —
+> costs ~50 ms per verify; at §3's 10M writes/month (3.86 writes/s), logins at 10% of that volume
+> are 0.39/s average and **3.86/s at the stated 10× peak**, so the hash costs **0.19 of a CPU core**
+> at peak — the usual reason to reach for something weaker does not exist here. Sessions are **10,000 concurrent × 200 B = 2 MB**, against a cache already sized for
 > snippet bodies, so statefulness is free. The claim flow dies on A.1.1's arithmetic: links come
 > from `md5(client_ip + timestamp)`, and a known IP on a known day is **86,400,000** candidate
 > milliseconds — cheap to brute-force — so "knows the link" is a forgeable credential, and claiming
@@ -1398,7 +1441,7 @@ the calculation changes and the registry table starts to earn its cost. At §3's
 > partitioning by `expires_at` makes `UNIQUE (shortlink)` impossible and leaves only
 > `UNIQUE (shortlink, expires_at)`, which permits the same link in two partitions. That destroys
 > A.1.2's four-step sequence and with it the fix for A.1.1 — the **highest-ranked entry in the
-> register**, at ~1,022 silent overwrites/month and ~18,400 to date. The cost side does not justify
+> register**, at ~341 silent overwrites/month and ~12,267 to date. The cost side does not justify
 > it: at **13,889 rows expiring per hour**, a covering index-only scan reads **1.39 MB** against
 > §7's **12 GB** (a factor of **8,640**), so daily expiry I/O is ~33 MB rather than 288 GB.
 > Partitioning would optimise 33 MB/day in exchange for a `shortlink_registry` table — a second
@@ -1441,18 +1484,20 @@ rollback.
 | # | Step | Rollback |
 |---|---|---|
 | 1 | **A.1.2 step 1**: `CREATE INDEX CONCURRENTLY idx_snippets_shortlink`. No lock, no application change | `DROP INDEX CONCURRENTLY`. Nothing depends on it yet |
-| 2 | **Widen `shortlink`** from `CHAR(7)` to `VARCHAR(16)`, so the column can hold A.1.1's 8-character links. The one non-additive step — detailed below | Depends on the technique; see below. Under the safe technique, drop the new column — the original is untouched throughout |
-| 3 | **A.1.2 step 2**: deploy the 8-character CSPRNG generator and the reversed write order. New links are 8 chars; 7-char links keep resolving forever, because the read is an equality lookup, not a parse | Revert the deploy. The 8-char links already minted keep working — the column is wide enough and the read path never cared about length |
-| 4 | **A.1.2 steps 3–4**: remediate duplicates, then swap to the unique index and enable `ON CONFLICT` retry | Step 3 is not reversible (the rows are gone, and their bodies were already gone). Step 4 is: `DROP INDEX` and disable the retry |
-| 5 | **Read-path fixes**: 404/410, cache-control headers, the `min(expiry, 1 h)` cache TTL, read-after-write retry against the primary, analytics moved off the request path. Flag-gated, canaried at 1% | Flag off. This is the one step with a live-contract change (B.7.4), so it canaries longest |
-| 6 | **Add columns**: `owner_id BIGINT NULL`, `visibility TEXT NOT NULL DEFAULT 'public'`. Catalogue-only, milliseconds. Nothing reads them yet | `DROP COLUMN`. No reader exists |
-| 7 | **Create `users`, `snippet_grants`; add the session and counter keyspaces to the cache.** All inert — no code path touches them | `DROP TABLE`. Inert by construction |
-| 8 | **Deploy v2 handlers and re-point v1 at them.** v1's external shape is unchanged; only its implementation moves. Canary by traffic share | Flip v1 back to the original handler, which stays in the binary until step 13 |
-| 9 | **Rate limiting in shadow mode**: counters increment, nothing is rejected, and the would-have-blocked rate is a metric. Run it for a full traffic cycle, then enforce | Flag off. Shadow mode *is* the rollback for enforcement — the limits are tuned against observed traffic before anyone is refused |
-| 10 | **Enable accounts**: register, login, logout, and ownership on authenticated creates. The anonymous path is untouched and unflagged | Flag off registration and login. Any accounts already created keep working; their snippets are owned rows, which read identically to ownerless ones |
-| 11 | **Enable private visibility** and the B.3 enforcement check. Until now every row is `public`, so the check is a no-op in production and can be deployed and observed before any row can exercise it | Flag off the ability to *set* `private`. Rows already private stay private — the enforcement code stays, only the transition is disabled. **Never** roll back by making private rows public |
-| 12 | **Replace the expiry job** (B.6). Run the new job alongside the old one for one cycle with deletes disabled, and compare the row sets they select | Re-enable the old job. It is the broken one, but it is strictly better than no expiry — see the note below |
-| 13 | **Begin v1 retirement**: `Deprecation`/`Sunset` headers and per-caller v1 metrics. This starts a measurement, not a countdown | Remove the headers. Nothing has been switched off |
+| 2 | **Widen `shortlink`** from `CHAR(7)` to `VARCHAR(16)`, so the column can hold A.1.1's 8-character links. The one non-additive step — detailed below. **Must complete in full, including the rename, before step 3** | Depends on the technique; see below. Under the safe technique, drop the new column — the original is untouched throughout |
+| 3 | **A.1.2 step 2**: deploy the 8-character CSPRNG generator and the reversed write order. **Gated on step 2 being fully complete** — an 8-character value into `CHAR(7)` is `ERROR: value too long`, so every create would fail. 7-char links keep resolving forever, because the read is an equality lookup, not a parse | Revert the deploy. The 8-char links already minted keep working — the column is wide enough and the read path never cared about length |
+| 4 | **A.1.2 steps 3–4**: remediate duplicates, **then** swap to the unique index and enable `ON CONFLICT` retry. This is the first point in the plan at which a unique constraint can exist at all | Remediation is not reversible (the rows are gone, and their bodies were already gone). The constraint is: `DROP INDEX` and disable the retry |
+| 5 | **Read-path fixes**: 404/410, cache-control headers, the `min(expiry, 1 h)` cache TTL, the bounded read-after-write primary retry, analytics moved off the request path. Flag-gated, canaried at 1% | Flag off. This is the one step with a live-contract change (B.7.4), so it canaries longest |
+| 6 | **Create `users`, `snippet_grants`; add the session and counter keyspaces to the cache.** All inert — no code path touches them. **Before step 7**, because step 7's `owner_id` references `users` | `DROP TABLE`. Inert by construction |
+| 7 | **Add columns**: `owner_id BIGINT NULL`, `visibility TEXT NOT NULL DEFAULT 'public'`. Both catalogue-only. Add the foreign key separately as `NOT VALID`, then `VALIDATE CONSTRAINT` — a validated FK added inline is *not* catalogue-only, and `NOT VALID` is available for foreign keys (unlike the unique constraint in step 4) | `DROP CONSTRAINT`, then `DROP COLUMN`. No reader exists |
+| 8 | **`CREATE INDEX CONCURRENTLY idx_snippets_expires_at ... INCLUDE (shortlink, object_key)`** (B.6). Another concurrent build over the 12 GB table; must precede step 14 | `DROP INDEX CONCURRENTLY`. The old expiry job does not use it |
+| 9 | **`CREATE INDEX CONCURRENTLY` on `(owner_id, created_at DESC, shortlink DESC)`** (B.5.3). Required before `GET /api/v2/snippets` is reachable in step 12; depends on step 7 | `DROP INDEX CONCURRENTLY`. Nothing reads it until step 12 |
+| 10 | **Deploy v2 handlers and re-point v1 at them.** v1's external shape is unchanged; only its implementation moves. Canary by traffic share | Flip v1 back to the original handler, which stays in the binary until step 15 |
+| 11 | **Rate limiting in shadow mode**: counters increment, nothing is rejected, and the would-have-blocked rate is a metric. Run it for a full traffic cycle, then enforce | Flag off. Shadow mode *is* the rollback for enforcement — the limits are tuned against observed traffic before anyone is refused |
+| 12 | **Enable accounts**: register, login, logout, ownership on authenticated creates, and the list endpoint. The anonymous path is untouched and unflagged | Flag off registration and login. Any accounts already created keep working; their snippets are owned rows, which read identically to ownerless ones |
+| 13 | **Enable private visibility** and the B.3 enforcement check. Until now every row is `public`, so the check is a no-op in production and can be deployed and observed before any row can exercise it | Flag off the ability to *set* `private`. Rows already private stay private — the enforcement code stays, only the transition is disabled. **Never** roll back by making private rows public |
+| 14 | **Replace the expiry job** (B.6). Run the new job alongside the old one for one cycle with deletes disabled, and compare the row sets they select | Re-enable the old job. It is the broken one, but it is strictly better than no expiry — see the note below |
+| 15 | **Begin v1 retirement**: `Deprecation`/`Sunset` headers and per-caller v1 metrics. This starts a measurement, not a countdown | Remove the headers. Nothing has been switched off |
 
 ### Step 2 in detail: the one change that touches existing rows
 
@@ -1476,17 +1521,35 @@ exists to avoid. Use the standard expand-and-contract sequence instead:
 
 1. `ALTER TABLE snippets ADD COLUMN shortlink_v2 VARCHAR(16) NULL;` — catalogue-only, O(1).
 2. Deploy code that **writes both columns** and still reads the old one. Reversible at any moment.
+   Note that throughout this window the generator is still producing **7-character** links, because
+   `shortlink` is still `CHAR(7)` and an 8-character value would fail the write. This is the
+   dependency that makes migration step 3 wait for this whole sequence.
 3. Backfill in batches: `UPDATE snippets SET shortlink_v2 = shortlink WHERE shortlink_v2 IS NULL`
-   over keyed ranges of 5,000. At 120 million rows that is **24,000 batches** — roughly **20
-   minutes** at 50 ms per batch, throttled to whatever the replicas tolerate, and resumable because
-   the predicate is self-describing. This deliberately reuses the same batching shape as B.6's
-   expiry job rather than inventing a second one.
-4. Add the index and unique constraint on `shortlink_v2`, then switch reads to it behind a flag.
+   over keyed ranges of 5,000, reusing B.6's batching shape rather than inventing a second one. At
+   120 million rows that is **24,000 batches**, and the naive estimate of 50 ms per batch gives 20
+   minutes — but that estimate is the optimistic one and the real constraints are downstream:
+   - Postgres has no in-place update, so this rewrites **every one of the 120 million rows**. That
+     is 120M dead tuples and the table bloating toward roughly twice its size before autovacuum
+     reclaims them, plus corresponding bloat in the step-1 `shortlink` index.
+   - Every update writes a **full-row WAL record**, and those records ship to replicas that §5
+     says follow asynchronously and that — until A.1.7's fix lands — have **no lag metric and no
+     alert**. Sustained replica lag is precisely the condition that makes A.1.4's empty-`200` race
+     fire, so a careless backfill reproduces the register's fourth entry at scale while fixing its
+     first.
+
+   So the backfill is throttled against a stated replica-lag ceiling (pause above 5 seconds, resume
+   below 1), autovacuum is tuned more aggressively for this table *before* it starts, and the run is
+   scheduled outside the peak band. Wall-clock is then measured in hours, not the nominal 20
+   minutes, and that is the correct trade.
+4. Build a **non-unique** index on `shortlink_v2` and switch reads to it behind a flag. **Not a
+   unique index** — the ~12,267 historical collisions are still in the table at this point, so a
+   unique build would abort exactly as A.1.2 describes. Uniqueness is migration step 4, after
+   remediation, and it is declared on `shortlink_v2` once the rename has made it `shortlink`.
 5. Once reads have been stable on the new column for a full cycle, drop `shortlink` and rename.
 
-The rollback for steps 1–4 is to flip the read flag back; the old column is still being written and
-is still correct. Only step 5 is one-way, and it comes after the new column has served all
-production reads for a cycle.
+The rollback for sub-steps 1–4 is to flip the read flag back; the old column is still being written
+and is still correct. Only sub-step 5 is one-way, and it comes after the new column has served all
+production reads for a cycle. **Migration step 3 does not begin until sub-step 5 has landed.**
 
 **Why this is worth the trouble** rather than keeping 7 characters: A.1.1 gives the arithmetic —
 7-character links are harvestable at one live snippet per 49 hours per address under B.4's read
@@ -1495,7 +1558,7 @@ these links, the 62× matters.
 
 **Three things about this ordering that are deliberate:**
 
-**Step 11's no-op window is the most valuable property in the plan.** Because `visibility` defaults
+**Step 13's no-op window is the most valuable property in the plan.** Because `visibility` defaults
 to `public` and nothing can set it otherwise until step 10, the enforcement check in B.3 runs
 against 100% of production traffic — 100 million reads/month — while being incapable of denying
 anyone, for as long as we want. A bug in the authorisation path shows up as an error rate or a
@@ -1503,7 +1566,7 @@ latency change with zero confidentiality consequence, because there is nothing p
 Any ordering that enabled private snippets and enforcement together would be testing an access
 control in the one configuration where a mistake is unrecoverable.
 
-**Step 12's rollback is honest rather than clean.** Reverting to §7's job restores a full 12 GB
+**Step 14's rollback is honest rather than clean.** Reverting to §7's job restores a full 12 GB
 scan every hour and restores the bug where popular snippets never actually expire. It is still the
 right rollback, because an expiry job that is wasteful and late beats no expiry at all — an outage
 here means snippets stay readable past their promised lifetime, which is the exact guarantee A.1.3
